@@ -570,8 +570,13 @@ static void gen_mark_blk(struct nvm_dev *dev, struct ppa_addr ppa, int type)
 	struct gen_lun *lun;
 	struct nvm_block *blk;
 
-	pr_debug("gen: ppa  (ch: %u lun: %u blk: %u pg: %u) -> %u\n",
-			ppa.g.ch, ppa.g.lun, ppa.g.blk, ppa.g.pg, type);
+	struct ppa_addr gen_ppa;
+
+	gen_ppa = dev_to_generic_addr(dev, ppa);
+
+	pr_err("gen: ppa  (ch: %u lun: %u blk: %u pg: %u) -> %u\n",
+			gen_ppa.g.ch, gen_ppa.g.lun, gen_ppa.g.blk,
+			gen_ppa.g.pg, type);
 
 	if (unlikely(ppa.g.ch > dev->nr_chnls ||
 					ppa.g.lun > dev->luns_per_chnl ||
@@ -616,9 +621,7 @@ static void gen_end_io(struct nvm_rq *rqd)
 {
 	struct nvm_tgt_instance *ins = rqd->ins;
 
-	if (rqd->error == NVM_RSP_ERR_FAILWRITE)
-		gen_mark_blk_bad(rqd->dev, rqd);
-
+	/* Write failures and bad blocks are managed within the target */
 	ins->tt->end_io(rqd);
 }
 
