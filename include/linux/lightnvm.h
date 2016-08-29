@@ -575,6 +575,8 @@ extern int nvm_dev_factory(struct nvm_dev *, int flags);
 		for ((lunid) = 0; (lunid) < (dev)->luns_per_chnl;	\
 					(lunid)++, (ppa).g.lun = (lunid))
 
+extern void nvm_nvmecmd_peek(void *cmd);
+
 #else /* CONFIG_NVM */
 struct nvm_dev_ops;
 

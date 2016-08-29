@@ -657,3 +657,157 @@ int nvme_nvm_ns_supported(struct nvme_ns *ns, struct nvme_id_ns *id)
 
 	return 0;
 }
+
+static void _peek_pread(struct nvme_nvm_command *cmd)
+{
+	int flags = le16_to_cpu(cmd->ph_rw.control);
+
+	if (flags != (NVM_IO_SNGL_ACCESS | NVM_IO_SUSPEND))
+		pr_err("R ERROR - flags:%d\n", flags);
+}
+
+static void _peek_pwrite(struct nvme_nvm_command *cmd)
+{
+	int flags = le16_to_cpu(cmd->ph_rw.control);
+	int nppas = le16_to_cpu(cmd->ph_rw.length) + 1;
+
+	int ppa_off = 0;
+	int i;
+	u64 *ppa_list, ppa1, ppa2, mask1, mask2, exp, exp2;
+
+	ppa_list = (u64*) phys_to_virt(le64_to_cpu(cmd->ph_rw.spba));
+
+	if (flags != NVM_IO_QUAD_ACCESS)
+		pr_err("W ERROR - flags:%d\n", flags);
+
+	if (((nppas) % 16))
+		pr_err("W ERROR - nppas:%d\n", nppas);
+
+next:
+	mask1 = 0xF0;
+	mask2 = 0xFFFFFF0F;
+
+	exp2 = ppa_list[ppa_off] & mask2;
+
+	for (i = ppa_off; i < ppa_off + 16; i++) {
+		exp = i % 16;
+		ppa1 = (ppa_list[i] & mask1) >> 4;
+		ppa2 = ppa_list[i] & mask2;
+
+		if (ppa2 != exp2) {
+			int j;
+
+			pr_err("W ERROR - exp:%llu, ppa2:%llu\n", exp2, ppa2);
+
+			for (j = ppa_off; j < ppa_off + 16; j++)
+				pr_err("dev[%d]:%llx\n", j, ppa_list[j]);
+		}
+
+		if (ppa1 != exp) {
+			int j;
+
+			pr_err("W ERROR - exp:%llu, ppa1:%llu\n", exp, ppa1);
+
+			for (j = ppa_off; j < ppa_off + 16; j++)
+				pr_err("dev[%d]:%llx\n", j, ppa_list[j]);
+		}
+
+		if (ppa_list[i] >> 31) {
+			int j;
+
+			pr_err("W ERROR - corrupted\b");
+
+			for (j = ppa_off; j < ppa_off + 16; j++)
+				pr_err("dev[%d]:%llx\n", j, ppa_list[j]);
+		}
+	}
+
+	ppa_off += 16;
+	if (ppa_off < nppas)
+		goto next;
+}
+
+void _peek_erase(struct nvme_nvm_command *cmd)
+{
+	int flags = le16_to_cpu(cmd->ph_rw.control);
+	int nppas = le16_to_cpu(cmd->ph_rw.length) + 1;
+
+	u64 *ppa_list, ppa, mask, exp;
+	int i;
+
+	ppa_list = (u64*) phys_to_virt(le64_to_cpu(cmd->ph_rw.spba));
+
+	if (flags != NVM_IO_QUAD_ACCESS)
+		pr_err("E ERROR - flags:%d\n", flags);
+
+	if (nppas != 4)
+		pr_err("E ERROR - nppas:%d\n", flags);
+
+	/* Planes */
+	mask = 0xC0;
+	for (i = 0; i < nppas; i++) {
+		exp = i;
+		ppa = (ppa_list[i] & mask) >> 6;
+
+		if (ppa != exp) {
+			int j;
+
+			pr_err("E ERROR - exp:%llu, ppa:%llu\n",
+					exp, ppa);
+
+			for (j = 0; j < nppas; j++)
+				pr_err("dev[%d]:%llx\n",
+						j, ppa_list[j]);
+		}
+	}
+}
+
+void _peek_setbb(struct nvme_nvm_command *cmd)
+{
+	uint64_t *ppa_list;
+	int i;
+
+	ppa_list = (uint64_t*) phys_to_virt(le64_to_cpu(cmd->ph_rw.spba));
+
+	pr_info("set_bb0{ opcode(%d), flags(%d), command_id(%d), nsid(%d) }\n",
+		cmd->set_bb.opcode, cmd->set_bb.flags,
+		cmd->set_bb.command_id, cmd->set_bb.nsid);
+	pr_info("set_bb1{ spba(%llu), nlb(%d), value(%d) }\n",
+		cmd->set_bb.spba,
+		cmd->set_bb.nlb,
+		cmd->set_bb.value
+		);
+	pr_info("set_bb2{ ppa_list(%p) }", ppa_list);
+	for (i = 0; i < cmd->set_bb.nlb+1; ++i) {
+		pr_info("set_bb3{ ppa_list[%d] = 0x%016llx }\n", i, ppa_list[i]);
+	}
+
+}
+
+#ifdef CONFIG_NVM_DEBUG
+void nvm_nvmecmd_peek(void *data)
+{
+	struct nvme_nvm_command *cmd = data;
+
+	switch (cmd->common.opcode) {
+		case 0xf1:
+			_peek_setbb(cmd);
+			break;
+		case NVM_OP_PWRITE:
+			_peek_pwrite(cmd);
+			break;
+		case NVM_OP_PREAD:
+			_peek_pread(cmd);
+			break;
+		case NVM_OP_ERASE:
+			_peek_erase(cmd);
+			break;
+		default:
+			pr_info("opcode(%d)\n",
+				cmd->common.opcode);
+			break;
+	}
+}
+#else
+void nvm_nvmecmd_peek(void *data) { }
+#endif	/* CONFIG_NVM_DEBUG */
