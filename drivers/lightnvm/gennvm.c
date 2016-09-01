@@ -20,6 +20,13 @@
 
 #include "gennvm.h"
 
+static LIST_HEAD(gennvm_list);
+static DEFINE_SPINLOCK(gennvm_list_lock);
+
+static struct class *gennvm_class;
+static int gennvm_char_major;
+static DEFINE_IDA(gennvm_instance_ida);
+
 static struct nvm_target *gen_find_target(struct gen_dev *gn, const char *name)
 {
 	struct nvm_target *tgt;
@@ -96,6 +103,8 @@ static int gen_create_tgt(struct nvm_dev *dev, struct nvm_ioctl_create *create)
 	t->disk = tdisk;
 	t->dev = dev;
 
+	kref_get(&gn->kref);
+
 	mutex_lock(&gn->lock);
 	list_add_tail(&t->list, &gn->targets);
 	mutex_unlock(&gn->lock);
@@ -128,6 +137,44 @@ static void __gen_remove_target(struct nvm_target *t)
 	kfree(t);
 }
 
+static void gen_free(struct gen_dev *gn)
+{
+	struct gen_lun *lun;
+	int i;
+
+	gen_for_each_lun(gn, lun, i) {
+		if (!lun->vlun.blocks)
+			break;
+		vfree(lun->vlun.blocks);
+	}
+
+	kfree(gn->luns);
+	kfree(gn);
+}
+
+static void gen_free_put(struct kref *kref)
+{
+	struct gen_dev *gn = container_of(kref, struct gen_dev, kref);
+
+	spin_lock(&gennvm_list_lock);
+	list_del(&gn->list);
+	spin_unlock(&gennvm_list_lock);
+
+	device_destroy(gennvm_class, MKDEV(gennvm_char_major, gn->instance));
+
+	put_device(gn->device);
+	ida_simple_remove(&gennvm_instance_ida, gn->instance);
+
+
+	gen_free(gn);
+	module_put(THIS_MODULE);
+}
+
+static void gen_put(struct gen_dev *gn)
+{
+	kref_put(&gn->kref, gen_free_put);
+}
+
 /**
  * gen_remove_tgt - Removes a target from the media manager
  * @dev:	device
@@ -155,6 +202,7 @@ static int gen_remove_tgt(struct nvm_dev *dev, struct nvm_ioctl_remove *remove)
 	__gen_remove_target(t);
 	mutex_unlock(&gn->lock);
 
+	gen_put(gn);
 	return 0;
 }
 
@@ -218,26 +266,6 @@ static void gen_put_area(struct nvm_dev *dev, sector_t begin)
 		return;
 	}
 	spin_unlock(&dev->lock);
-}
-
-static void gen_blocks_free(struct nvm_dev *dev)
-{
-	struct gen_dev *gn = dev->mp;
-	struct gen_lun *lun;
-	int i;
-
-	gen_for_each_lun(gn, lun, i) {
-		if (!lun->vlun.blocks)
-			break;
-		vfree(lun->vlun.blocks);
-	}
-}
-
-static void gen_luns_free(struct nvm_dev *dev)
-{
-	struct gen_dev *gn = dev->mp;
-
-	kfree(gn->luns);
 }
 
 static int gen_luns_init(struct nvm_dev *dev, struct gen_dev *gn)
@@ -410,14 +438,6 @@ static int gen_blocks_init(struct nvm_dev *dev, struct gen_dev *gn)
 	return 0;
 }
 
-static void gen_free(struct nvm_dev *dev)
-{
-	gen_blocks_free(dev);
-	gen_luns_free(dev);
-	kfree(dev->mp);
-	dev->mp = NULL;
-}
-
 static int gen_register(struct nvm_dev *dev)
 {
 	struct gen_dev *gn;
@@ -440,18 +460,40 @@ static int gen_register(struct nvm_dev *dev)
 	ret = gen_luns_init(dev, gn);
 	if (ret) {
 		pr_err("gen: could not initialize luns\n");
-		goto err;
+		goto out_release_dev;
 	}
 
 	ret = gen_blocks_init(dev, gn);
 	if (ret) {
 		pr_err("gen: could not initialize blocks\n");
-		goto err;
+		goto out_release_dev;
 	}
 
+	gn->instance = ida_simple_get(&gennvm_instance_ida, 0, 0, GFP_KERNEL);
+	if (gn->instance < 0) {
+		ret = gn->instance;
+		goto out_release_dev;
+	}
+
+	gn->device = device_create(gennvm_class, &dev->dev,
+				MKDEV(gennvm_char_major, gn->instance),
+				gn, dev->name);
+	if (IS_ERR(gn->device)) {
+		ret = PTR_ERR(gn->device);
+		goto out_release_instance;
+	}
+	kref_init(&gn->kref);
+
+	spin_lock(&gennvm_list_lock);
+	list_add_tail(&gn->list, &gennvm_list);
+	spin_unlock(&gennvm_list_lock);
+
 	return 1;
-err:
-	gen_free(dev);
+out_release_instance:
+	ida_simple_remove(&gennvm_instance_ida, gn->instance);
+out_release_dev:
+	gen_free(gn);
+	dev->mp = NULL;
 	module_put(THIS_MODULE);
 	return ret;
 }
@@ -466,11 +508,11 @@ static void gen_unregister(struct nvm_dev *dev)
 		if (t->dev != dev)
 			continue;
 		__gen_remove_target(t);
+		gen_put(gn);
 	}
 	mutex_unlock(&gn->lock);
 
-	gen_free(dev);
-	module_put(THIS_MODULE);
+	gen_put(gn);
 }
 
 static struct nvm_block *gen_get_blk(struct nvm_dev *dev,
@@ -666,14 +708,78 @@ static struct nvmm_type gen = {
 
 };
 
+static int gen_dev_open(struct inode *inode, struct file *file)
+{
+	struct gen_dev *gn;
+	int instance = iminor(inode);
+	int ret = -ENODEV;
+
+	spin_lock(&gennvm_list_lock);
+	list_for_each_entry(gn, &gennvm_list, list) {
+		if (gn->instance != instance)
+			continue;
+
+		if (!kref_get_unless_zero(&gn->kref))
+			break;
+		file->private_data = gn;
+		ret = 0;
+		break;
+	}
+	spin_unlock(&gennvm_list_lock);
+
+	return ret;
+}
+
+static int gen_dev_release(struct inode *inode, struct file *file)
+{
+	gen_put(file->private_data);
+	return 0;
+}
+
+static long gen_dev_ioctl(struct file *file, unsigned int cmd,
+			     unsigned long arg)
+{
+	return ENOTTY;
+}
+
+static const struct file_operations gen_dev_fops = {
+	.owner		= THIS_MODULE,
+	.open		= gen_dev_open,
+	.release	= gen_dev_release,
+	.unlocked_ioctl	= gen_dev_ioctl,
+	.compat_ioctl	= gen_dev_ioctl,
+};
+
+#define GENNVM_MINORS		(1U << MINORBITS)
+
 static int __init gen_module_init(void)
 {
+	int result;
+
+	result = __register_chrdev(gennvm_char_major, 0, GENNVM_MINORS,
+						"gennvm", &gen_dev_fops);
+	if (result < 0)
+		return result;
+	else if (result > 0)
+		gennvm_char_major = result;
+
+	gennvm_class = class_create(THIS_MODULE, "gennvm");
+	if (IS_ERR(gennvm_class)) {
+		result = PTR_ERR(gennvm_class);
+		goto unregister_chrdev;
+	}
+
 	return nvm_register_mgr(&gen);
+unregister_chrdev:
+	__unregister_chrdev(gennvm_char_major, 0, GENNVM_MINORS, "gennvm");
+	return result;
 }
 
 static void gen_module_exit(void)
 {
 	nvm_unregister_mgr(&gen);
+	class_destroy(gennvm_class);
+	__unregister_chrdev(gennvm_char_major, 0, GENNVM_MINORS, "gennvm");
 }
 
 module_init(gen_module_init);

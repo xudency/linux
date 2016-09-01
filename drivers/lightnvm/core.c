@@ -726,6 +726,8 @@ void nvm_unregister(struct nvm_dev *dev)
 	up_write(&nvm_lock);
 
 	nvm_exit(dev);
+
+	nvm_free_mgr(dev);
 }
 EXPORT_SYMBOL(nvm_unregister);
 

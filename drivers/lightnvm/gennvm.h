@@ -43,6 +43,11 @@ struct gen_dev {
 
 	struct mutex lock;
 	struct list_head targets;
+
+	int instance;
+	struct device *device;
+	struct kref kref;
+	struct list_head list;
 };
 
 struct gen_area {
