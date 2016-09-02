@@ -810,6 +810,73 @@ static int gen_ioctl_user_io(struct gen_dev *gn,
 	return 0;
 }
 
+static int gen_ioctl_get_block(struct gen_dev *gn,
+					struct nvm_ioctl_dev_vblk __user *uvblk)
+{
+	struct nvm_ioctl_dev_vblk vblk;
+	struct nvm_dev *dev = gn->dev;
+	struct nvm_lun *lun;
+	struct nvm_block *blk;
+	struct ppa_addr ppa;
+	int lun_id;
+
+	if (copy_from_user(&vblk, uvblk, sizeof(vblk)))
+		return -EFAULT;
+
+	if (vblk.flags != 0)
+		return -EINVAL;
+
+	/* TODO: do ppa range check */
+	ppa.ppa = vblk.ppa;
+	lun_id = (ppa.g.ch * dev->luns_per_chnl) + ppa.g.lun;
+	lun = dev->mt->get_lun(dev, lun_id);
+	if (!lun)
+		return -EINVAL;
+
+	blk = nvm_get_blk(dev, lun, 0);
+	if (!blk)
+		return -EFAULT;
+
+	/* TODO: return the ppa from blk in future */
+	ppa.g.blk = blk->id % dev->blks_per_lun;
+	vblk.ppa = ppa.ppa;
+
+	nvm_erase_blk(dev, blk);
+
+	if (copy_to_user(uvblk, &vblk, sizeof(vblk)))
+		return -EFAULT;
+
+	return 0;
+}
+
+static int gen_ioctl_put_block(struct gen_dev *gn,
+					struct nvm_ioctl_dev_vblk __user *uvblk)
+{
+	struct nvm_ioctl_dev_vblk vblk;
+	struct nvm_dev *dev = gn->dev;
+	struct nvm_block *block;
+	struct nvm_lun *lun;
+	struct ppa_addr ppa;
+	int lun_id;
+
+	if (copy_from_user(&vblk, uvblk, sizeof(vblk)))
+		return -EFAULT;
+
+	/* TODO: do ppa range check */
+	ppa.ppa = vblk.ppa;
+	lun_id = (ppa.g.ch * dev->luns_per_chnl) + ppa.g.lun;
+	lun = dev->mt->get_lun(dev, lun_id);
+	if (!lun)
+		return -EINVAL;
+
+	ppa.ppa = vblk.ppa;
+	block = &lun->blocks[ppa.g.blk];
+
+	nvm_put_blk(dev, block);
+
+	return 0;
+}
+
 static long gen_dev_ioctl(struct file *file, unsigned int cmd,
 			     unsigned long arg)
 {
@@ -819,6 +886,10 @@ static long gen_dev_ioctl(struct file *file, unsigned int cmd,
 	switch (cmd) {
 	case NVM_DEV_PIO_CMD:
 		return gen_ioctl_user_io(gn, argp);
+	case NVM_DEV_BLOCK_GET:
+		return gen_ioctl_get_block(gn, argp);
+	case NVM_DEV_BLOCK_PUT:
+		return gen_ioctl_put_block(gn, argp);
 	default:
 		return ENOTTY;
 	}
