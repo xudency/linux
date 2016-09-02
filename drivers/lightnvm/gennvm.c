@@ -736,10 +736,92 @@ static int gen_dev_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
+static int gen_setup_rq(struct gen_dev *gn, struct nvm_rq *rqd,
+						struct nvm_ioctl_dev_pio *io)
+{
+	struct nvm_dev *dev = gn->dev;
+	struct ppa_addr ppas[64];
+	int i, nppas, ret = 0;
+
+	nppas = io->nppas;
+
+	if (nppas == 1) {
+		struct ppa_addr ppa;
+
+		ppa.ppa = io->ppas;
+		rqd->ppa_addr = generic_to_dev_addr(dev, ppa);
+		return 0;
+	}
+
+	rqd->ppa_list = nvm_dev_dma_alloc(dev, GFP_KERNEL, &rqd->dma_ppa_list);
+	if (!rqd->ppa_list)
+		return NVM_IO_ERR;
+
+	if (copy_from_user(ppas, (void __user *)io->ppas, sizeof(u64) * io->nppas)) {
+		ret = -EFAULT;
+		goto out_free_ppa_list;
+	}
+
+	for (i = 0; i < nppas; i++) {
+		rqd->ppa_list[i] = generic_to_dev_addr(dev, ppas[i]);
+	/*	pr_info("addr: %i ch: %u sec: %u pl: %u lun: %u pg: %u blk: %u -> dev 0x%llx\n",
+				i,
+				ppas[i].g.ch,ppas[i].g.sec,
+				ppas[i].g.pl,ppas[i].g.lun,
+				ppas[i].g.pg,ppas[i].g.blk,
+				rqd->ppa_list[i].ppa);*/
+	}
+
+	return 0;
+out_free_ppa_list:
+	nvm_dev_dma_free(dev, rqd->ppa_list, rqd->dma_ppa_list);
+	return ret;
+}
+
+static int gen_ioctl_user_io(struct gen_dev *gn,
+					struct nvm_ioctl_dev_pio __user *uio)
+{
+	struct nvm_ioctl_dev_pio io;
+	struct nvm_dev *dev = gn->dev;
+	struct nvm_rq rqd;
+	int ret;
+
+	if (copy_from_user(&io, uio, sizeof(io)))
+		return -EFAULT;
+
+	memset(&rqd, 0, sizeof(struct nvm_rq));
+	ret = gen_setup_rq(gn, &rqd, &io);
+	if (ret)
+		return ret;
+
+	rqd.opcode = io.opcode;
+	rqd.nr_ppas = io.nppas;
+	rqd.flags = io.flags;
+
+	io.result = dev->ops->submit_user_io(dev, &rqd,
+						(void *)io.addr, io.data_len);
+	io.status = rqd.ppa_status;
+
+	if (rqd.nr_ppas > 1)
+		nvm_dev_dma_free(dev, rqd.ppa_list, rqd.dma_ppa_list);
+
+	copy_to_user(uio, &io, sizeof(io));
+
+	return 0;
+}
+
 static long gen_dev_ioctl(struct file *file, unsigned int cmd,
 			     unsigned long arg)
 {
-	return ENOTTY;
+	struct gen_dev *gn = file->private_data;
+	void __user *argp = (void __user *)arg;
+
+	switch (cmd) {
+	case NVM_DEV_PIO_CMD:
+		return gen_ioctl_user_io(gn, argp);
+	default:
+		return ENOTTY;
+	}
 }
 
 static const struct file_operations gen_dev_fops = {
