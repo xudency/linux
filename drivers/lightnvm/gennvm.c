@@ -884,7 +884,7 @@ static long gen_dev_ioctl(struct file *file, unsigned int cmd,
 	void __user *argp = (void __user *)arg;
 
 	switch (cmd) {
-	case NVM_DEV_PIO_CMD:
+	case NVM_DEV_PIO:
 		return gen_ioctl_user_io(gn, argp);
 	case NVM_DEV_BLOCK_GET:
 		return gen_ioctl_get_block(gn, argp);
