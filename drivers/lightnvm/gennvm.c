@@ -891,7 +891,7 @@ static long gen_dev_ioctl(struct file *file, unsigned int cmd,
 	case NVM_DEV_BLOCK_PUT:
 		return gen_ioctl_put_block(gn, argp);
 	default:
-		return ENOTTY;
+		return -ENOTTY;
 	}
 }
 
