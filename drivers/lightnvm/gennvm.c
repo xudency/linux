@@ -781,6 +781,59 @@ out_free_ppa_list:
 	return ret;
 }
 
+static int gen_ioctl_user_mark(struct nvm_dev *dev,
+						struct nvm_ioctl_dev_pio *io)
+{
+	const int NPPAS = io->nppas;
+	struct ppa_addr ppas[NPPAS];
+	dma_addr_t ppas_dma;
+	struct ppa_addr *ppas_virt;
+	int i, ret;
+
+	switch(io->flags) {	/* Ensure valid bad block type  */
+		case NVM_BLK_T_FREE:
+		case NVM_BLK_T_BAD:
+		case NVM_BLK_T_GRWN_BAD:
+			break;
+		default:
+			pr_err("nvm/gen: Invalid block-type(%d)\n", io->flags);
+			return -EINVAL;
+	}
+
+	/* Ensure that NPPAS does not exceed DMA allocation */
+	if (NPPAS > dev->ops->max_phys_sect) {
+		pr_err("nvm/gen: Too many ppas -> NPPAS(%d)\n", NPPAS);
+		return -EINVAL;
+	}
+
+	ret = copy_from_user(ppas, (void __user *)io->ppas,
+						sizeof(u64) * NPPAS);
+	if (ret) {
+		pr_err("nvm/gen: FAIL CFU io.opcode(0x%x) ret(%d)\n",
+							io->opcode, ret);
+		return -EFAULT;
+	}
+
+	ppas_virt = nvm_dev_dma_alloc(dev, GFP_KERNEL, &ppas_dma);
+	if (!ppas_virt) {
+		pr_err("nvm/gen: FAIL nvm_dev_dma_alloc\n");
+		return -EFAULT;
+	}
+
+	for (i = 0; i < NPPAS; ++i)
+		ppas_virt[i] = generic_to_dev_addr(dev, ppas[i]);
+
+	ret = dev->ops->set_bb_tbl(dev, (struct ppa_addr*)&ppas_dma,
+						NPPAS, io->flags);
+	nvm_dev_dma_free(dev, ppas_virt, ppas_dma);
+	if (ret) {
+		pr_err("nvm/gen: FAIL dev->ops->set_bb_tbl\n");
+		return -EFAULT;
+	}
+
+	return 0;
+}
+
 static int gen_ioctl_user_io(struct gen_dev *gn,
 					struct nvm_ioctl_dev_pio __user *uio)
 {
@@ -791,6 +844,10 @@ static int gen_ioctl_user_io(struct gen_dev *gn,
 
 	if (copy_from_user(&io, uio, sizeof(io)))
 		return -EFAULT;
+
+	if (io.opcode == 0xf1) {	/* MAGIC -- nvme_nvm_admin_set_bb_tbl */
+		return gen_ioctl_user_mark(gn->dev, &io);
+	}
 
 	memset(&rqd, 0, sizeof(struct nvm_rq));
 	ret = gen_setup_rq(gn, &rqd, &io);
