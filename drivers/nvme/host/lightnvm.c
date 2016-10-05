@@ -551,6 +551,7 @@ static int nvme_nvm_submit_user_io(struct nvm_dev *dev, struct nvm_rq *rqd,
 	DECLARE_COMPLETION_ONSTACK(wait);
 	unsigned long hang_check;
 	struct nvme_nvm_completion *cqe;
+	struct bio *bio = NULL;
 
 	rq = blk_mq_alloc_request(q, rqd->opcode & 1, 0);
 	if (IS_ERR(rq))
@@ -564,10 +565,14 @@ static int nvme_nvm_submit_user_io(struct nvm_dev *dev, struct nvm_rq *rqd,
 	}
 
 	rq->cmd_type = REQ_TYPE_DRV_PRIV;
-	if (data && blk_rq_map_user(q, rq, NULL, data, len, GFP_KERNEL)) {
-		blk_mq_free_request(rq);
-		kfree(cmd);
-		return -ENOMEM;
+	if (data) {
+		if (blk_rq_map_user(q, rq, NULL, data, len, GFP_KERNEL)) {
+			blk_mq_free_request(rq);
+			kfree(cmd);
+			return -ENOMEM;
+		}
+		bio = rq->bio;
+		bio_get(bio);
 	}
 
 	nvme_nvm_rqtocmd(rq, rqd, ns, cmd);
@@ -594,6 +599,10 @@ static int nvme_nvm_submit_user_io(struct nvm_dev *dev, struct nvm_rq *rqd,
 
 	rqd->error = rq->errors;
 
+	if (bio) {
+		blk_rq_unmap_user(bio);
+		bio_put(bio);
+	}
 	kfree(rq->cmd);
 	blk_mq_free_request(rq);
 
