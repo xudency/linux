@@ -564,7 +564,7 @@ static int nvme_nvm_submit_user_io(struct nvm_dev *dev, struct nvm_rq *rqd,
 	}
 
 	rq->cmd_type = REQ_TYPE_DRV_PRIV;
-	if (blk_rq_map_user(q, rq, NULL, data, len, GFP_KERNEL)) {
+	if (data && blk_rq_map_user(q, rq, NULL, data, len, GFP_KERNEL)) {
 		blk_mq_free_request(rq);
 		kfree(cmd);
 		return -ENOMEM;
