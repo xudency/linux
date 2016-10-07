@@ -798,8 +798,9 @@ static int gen_ioctl_user_io(struct gen_dev *gn,
 	rqd.nr_ppas = io.nppas;
 	rqd.flags = io.flags;
 
-	io.result = dev->ops->submit_user_io(dev, &rqd,
-						(void *)io.addr, io.data_len);
+	ret = dev->ops->submit_user_io(dev, &rqd, (void *)io.addr, io.data_len);
+
+	io.result = rqd.error;
 	io.status = rqd.ppa_status;
 
 	if (rqd.nr_ppas > 1)
@@ -807,7 +808,7 @@ static int gen_ioctl_user_io(struct gen_dev *gn,
 
 	copy_to_user(uio, &io, sizeof(io));
 
-	return 0;
+	return ret;
 }
 
 static int gen_ioctl_get_block(struct gen_dev *gn,
