@@ -367,6 +367,9 @@ struct cached_dev {
 	unsigned		writeback_rate_update_seconds;
 	unsigned		writeback_rate_d_term;
 	unsigned		writeback_rate_p_term_inverse;
+
+	unsigned short		ioprio_writeback;
+	unsigned short		ioprio_bypass;
 };
 
 enum alloc_reserve {
