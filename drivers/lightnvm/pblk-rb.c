@@ -510,10 +510,12 @@ unsigned int pblk_rb_read_to_bio(struct pblk_rb *rb, struct bio *bio,
 				 unsigned int count,
 				 unsigned long *sync_point)
 {
+	struct pblk *pblk = container_of(rb, struct pblk, rwb);
 	struct pblk_compl_ctx *c_ctx = ctx->c_ctx;
 	struct pblk_rb_entry *entry;
 	struct page *page;
 	unsigned int pad = 0, read = 0, to_read = nr_entries;
+	unsigned int user_io = 0;
 	unsigned int i;
 	int flags;
 	int ret;
@@ -538,6 +540,9 @@ try:
 		flags = READ_ONCE(entry->w_ctx.flags);
 		if (!(flags & PBLK_WRITTEN_DATA))
 			goto try;
+
+		if (flags & PBLK_IOTYPE_USER)
+			user_io++;
 
 		page = virt_to_page(entry->data);
 		if (!page) {
@@ -575,6 +580,7 @@ try:
 	}
 
 	read = to_read;
+	pblk_rl_user_out(pblk, user_io);
 
 #ifdef CONFIG_NVM_DEBUG
 	atomic_add(pad, &((struct pblk *)

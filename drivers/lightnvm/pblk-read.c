@@ -85,7 +85,7 @@ static int pblk_read_ppalist_rq(struct pblk *pblk, struct bio *bio,
 	int advanced_bio = 0;
 	int i, j = 0;
 
-	BUG_ON(!(laddr >= 0 && laddr + nr_secs < pblk->nr_secs));
+	BUG_ON(!(laddr >= 0 && laddr + nr_secs < pblk->rl.nr_secs));
 
 	pblk_setup_seq_reads(pblk, ppas, laddr, nr_secs);
 
@@ -342,7 +342,7 @@ static int pblk_read_rq(struct pblk *pblk, struct bio *bio, struct nvm_rq *rqd,
 		goto out;
 	}
 
-	BUG_ON(!(laddr >= 0 && laddr < pblk->nr_secs));
+	BUG_ON(!(laddr >= 0 && laddr < pblk->rl.nr_secs));
 
 	spin_lock(&pblk->trans_lock);
 	gp = &pblk->trans_map[laddr];
@@ -456,7 +456,7 @@ static int read_ppalist_rq_gc(struct pblk *pblk, struct bio *bio,
 		if (lba == ADDR_EMPTY || ppa_empty(*p))
 			continue;
 
-		BUG_ON(!(lba >= 0 && lba < pblk->nr_secs));
+		BUG_ON(!(lba >= 0 && lba < pblk->rl.nr_secs));
 
 		/* Try to read from write buffer. Those addresses that cannot be
 		 * read from the write buffer are sequentially added to the ppa

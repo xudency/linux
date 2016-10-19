@@ -531,7 +531,7 @@ void pblk_recov_clean_g_bb_list(struct pblk *pblk, struct pblk_lun *rlun)
 		 */
 		spin_lock(&rblk->lock);
 		if (bitmap_empty(rblk->sector_bitmap, pblk->nr_blk_dsecs))
-			pblk_put_blk_unlocked(pblk, rblk);
+			pblk_put_blk(pblk, rblk);
 		spin_unlock(&rblk->lock);
 	}
 }

@@ -89,21 +89,14 @@ int pblk_write_to_cache(struct pblk *pblk, struct bio *bio, unsigned long flags)
 		}
 	}
 
-	pblk_rl_rate_user_io(pblk, nr_secs);
+	pblk_rl_user_in(pblk, nr_secs);
 
 retry:
-	//JAVIER: TOGO
-	/* if (unlikely(pblk_gc_is_emergency(pblk))) */
-		/* return NVM_IO_REQUEUE; */
-
 	ret = __pblk_write_to_cache(pblk, bio, flags, nr_secs);
 	if (ret == NVM_IO_REQUEUE) {
 		schedule();
 		goto retry;
 	}
-
-	//JAVIER: TOGO
-	/* pblk_may_submit_write(pblk, nr_secs); */
 
 	spin_lock_irq(&pblk->lock);
 	pblk->write_cnt += nr_secs;
@@ -186,8 +179,6 @@ int pblk_write_gc_to_cache(struct pblk *pblk, void *data, u64 *lba_list,
 			   struct pblk_block *gc_rblk)
 {
 	int ret;
-
-	pblk_rl_rate_gc_io(pblk, nr_secs);
 
 retry:
 	ret = __pblk_write_gc_to_cache(pblk, data, lba_list, ref_buf, gc_rblk,

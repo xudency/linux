@@ -20,9 +20,6 @@
 int pblk_replace_blk(struct pblk *pblk, struct pblk_block *rblk,
 		     struct pblk_lun *rlun, int lun_pos)
 {
-	/* TODO: Emergency GC will be integrated on the rate limiter */
-	pblk_gc_check_emergency_in(pblk, rlun);
-
 	rblk = pblk_get_blk(pblk, rlun);
 	if (!rblk) {
 		pr_debug("pblk: could not get new block\n");
@@ -229,10 +226,6 @@ int pblk_submit_write(struct pblk *pblk)
 						secs_avail, &sync_point);
 	if (!pgs_read)
 		goto fail_sync;
-
-	atomic_sub(pgs_read, &pblk->rl.rb_user_cnt);
-	if (waitqueue_active(&pblk->wait2))
-		wake_up_all(&pblk->wait2);
 
 	if (secs_to_flush <= secs_to_sync)
 		pblk_rb_sync_point_reset(&pblk->rwb, sync_point);

@@ -68,7 +68,7 @@ static blk_qc_t pblk_make_rq(struct request_queue *q, struct bio *bio)
 			return BLK_QC_T_NONE;
 	}
 
-	err = pblk_submit_io(q, pblk, bio, PBLK_IOTYPE_NONE);
+	err = pblk_submit_io(q, pblk, bio, PBLK_IOTYPE_USER);
 	switch (err) {
 	case NVM_IO_OK:
 		return BLK_QC_T_NONE;
@@ -119,11 +119,11 @@ static int pblk_l2p_init(struct pblk *pblk)
 
 	slba = pblk->soffset >> (ilog2(dev->sec_size) - 9);
 
-	pblk->trans_map = vzalloc(sizeof(struct pblk_addr) * pblk->nr_secs);
+	pblk->trans_map = vzalloc(sizeof(struct pblk_addr) * pblk->rl.nr_secs);
 	if (!pblk->trans_map)
 		return -ENOMEM;
 
-	for (i = 0; i < pblk->nr_secs; i++) {
+	for (i = 0; i < pblk->rl.nr_secs; i++) {
 		struct pblk_addr *p = &pblk->trans_map[i];
 
 		p->rblk = NULL;
@@ -404,8 +404,8 @@ static int pblk_luns_init(struct pblk *pblk, int lun_begin, int lun_end)
 		spin_lock_init(&rlun->lock);
 		spin_lock_init(&rlun->lock_lists);
 
-		pblk->total_blocks += dev->blks_per_lun;
-		pblk->nr_secs += dev->sec_per_lun;
+		pblk->rl.total_blocks += dev->blks_per_lun;
+		pblk->rl.nr_secs += dev->sec_per_lun;
 	}
 
 	ret = pblk_map_init(pblk);
@@ -424,7 +424,7 @@ static int pblk_area_init(struct pblk *pblk, sector_t *begin)
 {
 	struct nvm_dev *dev = pblk->dev;
 	struct nvmm_type *mt = dev->mt;
-	sector_t size = pblk->nr_secs * dev->sec_size;
+	sector_t size = pblk->rl.nr_secs * dev->sec_size;
 
 	size >>= 9;
 
@@ -495,7 +495,7 @@ static sector_t pblk_capacity(void *private)
 	reserved = pblk->nr_luns * dev->sec_per_blk * 4;
 	provisioned = pblk->capacity - reserved;
 
-	if (reserved > pblk->nr_secs) {
+	if (reserved > pblk->rl.nr_secs) {
 		pr_err("pblk: not enough space available to expose storage.\n");
 		return 0;
 	}
@@ -586,10 +586,13 @@ static ssize_t pblk_sysfs_luns_active_show(struct pblk *pblk, char *page)
 					pblk_map_get_active_luns(pblk));
 }
 
-static ssize_t pblk_sysfs_gc_active_show(struct pblk *pblk, char *page)
+static ssize_t pblk_sysfs_gc_state_show(struct pblk *pblk, char *page)
 {
-	return sprintf(page, "gc_active=%d\n",
-					pblk_gc_sysfs_active_show(pblk));
+	int gc_enabled, gc_active;
+
+	pblk_gc_sysfs_state_show(pblk, &gc_enabled, &gc_active);
+	return sprintf(page, "gc_enabled=%d, gc_active=%d\n",
+					gc_enabled, gc_active);
 }
 
 static ssize_t pblk_sysfs_rate_show(struct pblk *pblk, char *page)
@@ -641,8 +644,8 @@ static ssize_t pblk_sysfs_consume_blocks_store(struct pblk *pblk,
 	return len;
 }
 
-static ssize_t pblk_sysfs_gc_active_store(struct pblk *pblk,
-					  const char *page, size_t len)
+static ssize_t pblk_sysfs_gc_state_store(struct pblk *pblk,
+					 const char *page, size_t len)
 {
 	size_t c_len;
 	int value;
@@ -653,7 +656,7 @@ static ssize_t pblk_sysfs_gc_active_store(struct pblk *pblk,
 		return -EINVAL;
 
 	sscanf(page, "%d", &value);
-	ret = pblk_gc_sysfs_active_store(pblk, value);
+	ret = pblk_gc_sysfs_enable(pblk, value);
 	if (ret)
 		return ret;
 
@@ -713,33 +716,25 @@ static ssize_t pblk_sysfs_stats(struct pblk *pblk, char *page)
 	return offset;
 }
 
-/* merge with pblk_write_user_update the one in pblk_core */
-static unsigned int pblk_get_avail_blks(struct pblk *pblk)
-{
-	int i;
-	unsigned int avail = 0;
-	struct pblk_lun *rlun;
-
-	for (i = 0; i < pblk->nr_luns; i++) {
-		rlun = &pblk->luns[i];
-		spin_lock(&rlun->lock);
-		avail += rlun->mgmt->nr_free_blocks;
-		spin_unlock(&rlun->lock);
-	}
-
-	return avail;
-}
-
 static ssize_t pblk_sysfs_write_max(struct pblk *pblk, char *page)
 {
-	unsigned int avail = pblk_get_avail_blks(pblk);
+	unsigned long free_blocks;
+	int rb_user_max;
 
-	return sprintf(page, "%uKBs (max:%dKBs, stop:<%lu, fullspd:>%lu, avail:%u)\n",
-				pblk->write_cur_speed,
-				pblk_rl_calc_max_wr_speed(pblk),
-				pblk->total_blocks / PBLK_USER_LOW_THRS,
-				pblk->total_blocks / PBLK_USER_HIGH_THRS,
-				avail);
+	spin_lock(&pblk->rl.lock);
+	free_blocks = pblk->rl.free_blocks;
+	rb_user_max = pblk->rl.rb_user_max;
+	spin_unlock(&pblk->rl.lock);
+
+	return sprintf(page, "wb:%u/%lu (stop:<%u/%u, fullspd:>%u/%u, avail:%lu)\n",
+				pblk->rl.rb_user_max,
+				pblk_rb_nr_entries(&pblk->rwb),
+				pblk->rl.low,
+				pblk->rl.low_lun,
+				pblk->rl.high,
+				pblk->rl.high_lun,
+				free_blocks);
+	return 0;
 }
 
 #ifdef CONFIG_NVM_DEBUG
@@ -859,12 +854,11 @@ static ssize_t pblk_sysfs_gc_blks(struct pblk *pblk, char *buf)
 
 		spin_lock(&lun->lock);
 		list_for_each_entry(rblk, &rlun->prio_list, prio) {
-			printk(KERN_CRIT "blk:%lu\n", rblk->parent->id);
 			p = pblk_blk_ppa_to_gaddr(pblk->dev, rblk->b_gen_ppa,
 						block_to_addr(pblk, rblk));
 			spin_lock(&rblk->lock);
 			sz += sprintf(buf + sz,
-				"gc:\tblk:%lu(ch:%d,pl:%d,lun:%d,blk:%d)\n",
+				"gc:\tblk:%lu (ch:%d,pl:%d,lun:%d,blk:%d)\n",
 				rblk->parent->id,
 				p.g.ch, p.g.pl, p.g.lun, p.g.blk);
 			spin_unlock(&rblk->lock);
@@ -972,10 +966,10 @@ static ssize_t pblk_sysfs_l2p_map_sanity(struct pblk *pblk, const char *buf,
 
 	if (lba_end == 0) {
 		lba_init = 0;
-		lba_end = pblk->nr_secs;
+		lba_end = pblk->rl.nr_secs;
 	}
 
-	if (lba_end > pblk->nr_secs) {
+	if (lba_end > pblk->rl.nr_secs) {
 		pr_err("pblk: Incorrect lba limit\n");
 		goto out;
 	}
@@ -1081,7 +1075,7 @@ static ssize_t pblk_sysfs_cleanup(struct pblk *pblk, const char *buf,
 
 	/* Cleanup L2P table */
 	spin_lock(&pblk->trans_lock);
-	for (i = 0; i < pblk->nr_secs; i++) {
+	for (i = 0; i < pblk->rl.nr_secs; i++) {
 		struct pblk_addr *p = &pblk->trans_map[i];
 
 		p->rblk = NULL;
@@ -1142,8 +1136,8 @@ static struct attribute sys_write_max_attr = {
 	.mode = S_IRUGO,
 };
 
-static struct attribute sys_gc_active = {
-	.name = "gc_active",
+static struct attribute sys_gc_state = {
+	.name = "gc_state",
 	.mode = S_IRUGO | S_IWUSR,
 };
 
@@ -1232,7 +1226,7 @@ static struct attribute *pblk_attrs[] = {
 	&sys_write_max_attr,
 	&sys_stats_attr,
 	&sys_inflight_writes_attr,
-	&sys_gc_active,
+	&sys_gc_state,
 	&sys_gc_force,
 	&sys_rate,
 #ifdef CONFIG_NVM_DEBUG
@@ -1269,8 +1263,8 @@ static ssize_t pblk_sysfs_show(struct nvm_target *t, struct attribute *attr,
 		return pblk_sysfs_stats(pblk, buf);
 	else if (strcmp(attr->name, "write_max") == 0)
 		return pblk_sysfs_write_max(pblk, buf);
-	else if (strcmp(attr->name, "gc_active") == 0)
-		return pblk_sysfs_gc_active_show(pblk, buf);
+	else if (strcmp(attr->name, "gc_state") == 0)
+		return pblk_sysfs_gc_state_show(pblk, buf);
 	else if (strcmp(attr->name, "rate") == 0)
 		return pblk_sysfs_rate_show(pblk, buf);
 #ifdef CONFIG_NVM_DEBUG
@@ -1303,8 +1297,8 @@ static ssize_t pblk_sysfs_store(struct nvm_target *t, struct attribute *attr,
 		return pblk_sysfs_luns_active_store(pblk, buf, len);
 	else if (strcmp(attr->name, "consume_blocks") == 0)
 		return pblk_sysfs_consume_blocks_store(pblk, buf, len);
-	else if (strcmp(attr->name, "gc_active") == 0)
-		return pblk_sysfs_gc_active_store(pblk, buf, len);
+	else if (strcmp(attr->name, "gc_state") == 0)
+		return pblk_sysfs_gc_state_store(pblk, buf, len);
 	else if (strcmp(attr->name, "gc_force") == 0)
 		return pblk_sysfs_gc_force(pblk, buf, len);
 	else if (strcmp(attr->name, "rate") == 0)
@@ -1425,9 +1419,6 @@ static void *pblk_init(struct nvm_dev *dev, struct gendisk *tdisk,
 
 	pblk->nr_blk_dsecs = pblk_recov_init(pblk);
 
-	pblk->write_cur_speed = pblk->write_max_speed =
-						pblk_rl_calc_max_wr_speed(pblk);
-
 	ret = pblk_core_init(pblk);
 	if (ret) {
 		pr_err("pblk: could not initialize core\n");
@@ -1446,6 +1437,8 @@ static void *pblk_init(struct nvm_dev *dev, struct gendisk *tdisk,
 		goto err;
 	}
 
+	pblk_rl_init(pblk);
+
 	ret = pblk_luns_configure(pblk);
 	if (ret) {
 		pr_err("pblk: not enough blocks available in LUNs.\n");
@@ -1458,8 +1451,6 @@ static void *pblk_init(struct nvm_dev *dev, struct gendisk *tdisk,
 		goto err;
 	}
 
-	pblk_rl_init(pblk);
-
 	/* inherit the size from the underlying device */
 	blk_queue_logical_block_size(tqueue, queue_physical_block_size(bqueue));
 	blk_queue_max_hw_sectors(tqueue, queue_max_hw_sectors(bqueue));
@@ -1467,10 +1458,8 @@ static void *pblk_init(struct nvm_dev *dev, struct gendisk *tdisk,
 	blk_queue_write_cache(tqueue, true, false);
 
 	pr_info("pblk init: luns:%u, %llu sectors, buffer entries:%lu\n",
-			pblk->nr_luns, (unsigned long long)pblk->nr_secs,
+			pblk->nr_luns, (unsigned long long)pblk->rl.nr_secs,
 			pblk_rb_nr_entries(&pblk->rwb));
-
-	mod_timer(&pblk->gc_timer, jiffies + msecs_to_jiffies(5000));
 
 	setup_timer(&pblk->wtimer, pblk_write_timer_fn, (unsigned long)pblk);
 	mod_timer(&pblk->wtimer, jiffies + msecs_to_jiffies(100));

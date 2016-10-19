@@ -17,10 +17,6 @@
 
 #include "pblk.h"
 
-static int gc_active;
-static int force_gc;
-static DECLARE_RWSEM(gc_lock);
-
 static void pblk_free_gc_rqd(struct pblk *pblk, struct nvm_rq *rqd)
 {
 	uint8_t nr_secs = rqd->nr_ppas;
@@ -52,7 +48,7 @@ static void pblk_gc_setup_rq(struct pblk *pblk, struct pblk_block *rblk,
 		}
 
 #ifdef CONFIG_NVM_DEBUG
-	BUG_ON(!(lba >= 0 && lba < pblk->nr_secs));
+	BUG_ON(!(lba >= 0 && lba < pblk->rl.nr_secs));
 #endif
 	}
 }
@@ -127,112 +123,8 @@ static void pblk_gc_kick(struct pblk *pblk)
 }
 
 /*
- * Emergency GC
- */
-static void pblk_gc_emergency_on(struct pblk *pblk, int pos)
-{
-	struct pblk_gc_thresholds *th = &pblk->gc_ths;
-
-	spin_lock(&th->lock);
-	set_bit(pos, th->emergency_luns);
-	th->user_io_rate = 1;
-
-	pr_debug("pblk: enter emergency GC. Lun:%d\n",
-						pblk->luns[pos].parent->id);
-	spin_unlock(&th->lock);
-}
-
-static void pblk_gc_emergency_off(struct pblk *pblk, int pos)
-{
-	struct pblk_gc_thresholds *th = &pblk->gc_ths;
-
-	spin_lock(&th->lock);
-	clear_bit(pos, th->emergency_luns);
-
-	if (bitmap_empty(th->emergency_luns, pblk->nr_luns)) {
-		pr_debug("pblk: exit emergency GC\n");
-		th->user_io_rate = 0;
-	}
-	spin_unlock(&th->lock);
-}
-
-static int pblk_gc_lun_is_emergency(struct pblk *pblk, int pos)
-{
-	struct pblk_gc_thresholds *th = &pblk->gc_ths;
-	int ret;
-
-	spin_lock(&th->lock);
-	ret = test_bit(pos, th->emergency_luns);
-	spin_unlock(&th->lock);
-
-	return ret;
-}
-
-static int pblk_gc_lun_is_emer(struct pblk *pblk, struct nvm_lun *lun)
-{
-	struct pblk_gc_thresholds *th = &pblk->gc_ths;
-
-#ifdef CONFIG_NVM_DEBUG
-	lockdep_assert_held(&lun->lock);
-#endif
-	return (lun->mgmt->nr_free_blocks < th->emergency);
-}
-
-int pblk_gc_is_emergency(struct pblk *pblk)
-{
-	struct pblk_gc_thresholds *th = &pblk->gc_ths;
-	int ret;
-
-	spin_lock(&th->lock);
-	ret = th->user_io_rate;
-	spin_unlock(&th->lock);
-
-	return ret;
-}
-
-void pblk_gc_check_emergency_in(struct pblk *pblk, struct pblk_lun *rlun)
-{
-	struct nvm_lun *lun = rlun->parent;
-	int emergency_th, emergency_gc;
-
-	/* If the number of free blocks in the LUN goes below the threshold, get
-	 * in emergency GC mode.
-	 *
-	 * TODO: This should be progressive and affect the rate limiter to
-	 * reduce user I/O as the disk gets more and more full. For now, we only
-	 * implement emergency GC: when the disk reaches capacity, user I/O is
-	 * stopped and GC is the only one adding entries to the write buffer in
-	 * order to free blocks
-	 */
-	spin_lock(&lun->lock);
-	emergency_gc = pblk_gc_lun_is_emergency(pblk, rlun->prov_pos);
-	emergency_th = pblk_gc_lun_is_emer(pblk, lun);
-	spin_unlock(&lun->lock);
-
-	if (!emergency_gc && emergency_th) {
-		pblk_gc_emergency_on(pblk, rlun->prov_pos);
-		pblk_gc_kick(pblk);
-	}
-}
-
-void pblk_gc_check_emergency_out(struct pblk *pblk, struct pblk_lun *rlun)
-{
-	struct nvm_lun *lun = rlun->parent;
-	int emergency_th, emergency_gc;
-
-	spin_lock(&lun->lock);
-	emergency_gc = pblk_gc_lun_is_emergency(pblk, rlun->prov_pos);
-	emergency_th = pblk_gc_lun_is_emer(pblk, lun);
-	spin_unlock(&lun->lock);
-
-	if (unlikely(emergency_gc) && !emergency_th)
-		pblk_gc_emergency_off(pblk, rlun->prov_pos);
-}
-
-/*
  * GC move valid sectors
  */
-
 static int pblk_gc_write_to_buffer(struct pblk *pblk, u64 *lba_list,
 				   void *data, struct pblk_kref_buf *ref_buf,
 				   unsigned int data_len,
@@ -424,7 +316,6 @@ static void pblk_block_gc(struct work_struct *work)
 
 	mempool_free(blk_ws, pblk->blk_ws_pool);
 	pr_debug("pblk: block '%lu' being reclaimed\n", rblk->parent->id);
-	pr_err("pblk: block '%lu' being reclaimed\n", rblk->parent->id);
 
 	recov_page = kzalloc(page_size, GFP_KERNEL);
 	if (!recov_page)
@@ -481,8 +372,6 @@ prepare_ppas:
 	pblk_erase_blk(pblk, rblk);
 	pblk_put_blk(pblk, rblk);
 
-	pblk_gc_check_emergency_out(pblk, rlun);
-
 	kfree(invalid_bitmap);
 	kfree(recov_page);
 	return;
@@ -499,23 +388,22 @@ put_back:
 
 static void pblk_lun_gc(struct pblk *pblk, struct pblk_lun *rlun)
 {
+	struct pblk_gc *gc = &pblk->gc;
 	struct pblk_block_ws *blk_ws;
 	struct pblk_block *rblk, *trblk;
 	unsigned int nr_free_blocks, nr_blocks_need;
-	int emergency_gc;
 	int run_gc;
 	LIST_HEAD(gc_list);
 
-	nr_blocks_need = pblk->dev->blks_per_lun / GC_LIMIT_INVERSE;
+	nr_blocks_need = pblk_rl_gc_thrs(pblk);
 
 	if (nr_blocks_need < pblk->nr_luns)
 		nr_blocks_need = pblk->nr_luns;
 
 	spin_lock(&rlun->lock);
-	emergency_gc = pblk_gc_lun_is_emergency(pblk, rlun->prov_pos);
 	nr_free_blocks = rlun->mgmt->nr_free_blocks;
 
-	run_gc = (nr_blocks_need > nr_free_blocks || force_gc);
+	run_gc = (nr_blocks_need > nr_free_blocks || gc->gc_forced);
 	while (run_gc && !list_empty(&rlun->prio_list)) {
 		rblk = block_prio_find_max(rlun);
 		if (!rblk->nr_invalid_secs)
@@ -524,7 +412,7 @@ static void pblk_lun_gc(struct pblk *pblk, struct pblk_lun *rlun)
 		nr_free_blocks++;
 		list_move_tail(&rblk->prio, &gc_list);
 
-		run_gc = (nr_blocks_need > nr_free_blocks || force_gc);
+		run_gc = (nr_blocks_need > nr_free_blocks || gc->gc_forced);
 	}
 
 start_gc:
@@ -538,8 +426,6 @@ start_gc:
 		list_del_init(&rblk->prio);
 
 		BUG_ON(!block_is_full(pblk, rblk));
-
-		pr_debug("pblk: victim block '%lu' for GC\n", rblk->parent->id);
 
 		blk_ws->pblk = pblk;
 		blk_ws->rblk = rblk;
@@ -580,24 +466,60 @@ static void pblk_gc_timer(unsigned long data)
 static void pblk_gc_start(struct pblk *pblk)
 {
 	setup_timer(&pblk->gc_timer, pblk_gc_timer, (unsigned long)pblk);
+	mod_timer(&pblk->gc_timer, jiffies + msecs_to_jiffies(5000));
 
-	/* TODO: Enable rate-limiter here */
+	pblk->gc.gc_active = 1;
 
-	gc_active = 1;
-
-	pr_debug("pblk: gc enabled\n");
+	pr_debug("pblk: gc running\n");
 }
 
-static void pblk_gc_stop(struct pblk *pblk)
+/* If flush_wq == 1 then no lock should be held by the caller since
+ * flush_workqueue can sleep
+ */
+static void pblk_gc_stop(struct pblk *pblk, int flush_wq)
 {
 	del_timer(&pblk->gc_timer);
-	flush_workqueue(pblk->kgc_wq);
 
-	/* TODO: Disable rate-limiter here */
+	if (flush_wq)
+		flush_workqueue(pblk->kgc_wq);
 
-	gc_active = 0;
+	spin_lock(&pblk->gc.lock);
+	pblk->gc.gc_active = 0;
+	spin_unlock(&pblk->gc.lock);
 
-	pr_debug("pblk: gc disabled\n");
+	pr_debug("pblk: gc paused\n");
+}
+
+int pblk_gc_status(struct pblk *pblk)
+{
+	struct pblk_gc *gc = &pblk->gc;
+	int ret;
+
+	spin_lock(&gc->lock);
+	ret = gc->gc_active;
+	spin_unlock(&gc->lock);
+
+	return ret;
+}
+
+void pblk_gc_should_start(struct pblk *pblk)
+{
+	struct pblk_gc *gc = &pblk->gc;
+
+#ifdef CONFIG_NVM_DEBUG
+	lockdep_assert_held(&gc->lock);
+#endif
+
+	if (gc->gc_enabled && !gc->gc_active)
+		pblk_gc_start(pblk);
+}
+
+void pblk_gc_should_stop(struct pblk *pblk)
+{
+	struct pblk_gc *gc = &pblk->gc;
+
+	if (gc->gc_active && !gc->gc_forced)
+		pblk_gc_stop(pblk, 0);
 }
 
 int pblk_gc_init(struct pblk *pblk)
@@ -611,27 +533,14 @@ int pblk_gc_init(struct pblk *pblk)
 	if (!pblk->kgc_wq)
 		goto fail_destrow_krqd_qw;
 
-	/* The write buffer has space for one block per active LUN on the
-	 * target. In emergency GC we need to be able to flush the whole buffer,
-	 * which in the worst case is full with user I/O.
-	 */
-	pblk->gc_ths.emergency_luns = kzalloc(BITS_TO_LONGS(pblk->dev->nr_luns) *
-					sizeof(unsigned long), GFP_KERNEL);
-	if (!pblk->gc_ths.emergency_luns)
-		goto fail_destrow_kgc_qw;
+	pblk->gc.gc_active = 0;
+	pblk->gc.gc_forced = 0;
+	pblk->gc.gc_enabled = 1;
 
-	spin_lock_init(&pblk->gc_ths.lock);
-
-	pblk->gc_ths.emergency = 4;
-	pblk->gc_ths.user_io_rate = 0;
-
-	force_gc = 0;
-	pblk_gc_start(pblk);
+	spin_lock_init(&pblk->gc.lock);
 
 	return 0;
 
-fail_destrow_kgc_qw:
-	destroy_workqueue(pblk->kgc_wq);
 fail_destrow_krqd_qw:
 	destroy_workqueue(pblk->krqd_wq);
 	return -ENOMEM;
@@ -639,55 +548,63 @@ fail_destrow_krqd_qw:
 
 void pblk_gc_exit(struct pblk *pblk)
 {
-	pblk_gc_stop(pblk);
+	pblk_gc_stop(pblk, 1);
 
 	if (pblk->krqd_wq)
 		destroy_workqueue(pblk->krqd_wq);
 
 	if (pblk->kgc_wq)
 		destroy_workqueue(pblk->kgc_wq);
-
-	kfree(pblk->gc_ths.emergency_luns);
 }
 
-int pblk_gc_sysfs_active_show(struct pblk *pblk)
+void pblk_gc_sysfs_state_show(struct pblk *pblk, int *gc_enabled,
+			      int *gc_active)
 {
-	int state;
+	struct pblk_gc *gc = &pblk->gc;
 
-	down_write(&gc_lock);
-	state = gc_active;
-	up_write(&gc_lock);
-
-	return state;
+	spin_lock(&gc->lock);
+	*gc_enabled = gc->gc_enabled;
+	*gc_active = gc->gc_active;
+	spin_unlock(&gc->lock);
 }
 
 int pblk_gc_sysfs_force(struct pblk *pblk, int value)
 {
+	struct pblk_gc *gc = &pblk->gc;
+
 	if (value != 0 && value != 1)
 		return -EINVAL;
 
-	down_write(&gc_lock);
-	force_gc = value;
-	up_write(&gc_lock);
+	spin_lock(&gc->lock);
+	if (value == 1)
+		gc->gc_enabled = 1;
+	gc->gc_forced = value;
+	pblk_gc_should_start(pblk);
+	spin_unlock(&gc->lock);
 
 	return 0;
 }
 
-int pblk_gc_sysfs_active_store(struct pblk *pblk, int value)
+int pblk_gc_sysfs_enable(struct pblk *pblk, int value)
 {
+	struct pblk_gc *gc = &pblk->gc;
 	int ret = 0;
 
-	down_write(&gc_lock);
 	if (value == 0) {
-		if (gc_active)
-			pblk_gc_stop(pblk);
+		spin_lock(&gc->lock);
+		gc->gc_enabled = value;
+		spin_unlock(&gc->lock);
+		if (gc->gc_active)
+			pblk_gc_stop(pblk, 0);
 	} else if (value == 1) {
-		if (!gc_active)
+		spin_lock(&gc->lock);
+		gc->gc_enabled = value;
+		if (!gc->gc_active)
 			pblk_gc_start(pblk);
+		spin_unlock(&gc->lock);
 	} else {
 		ret = -EINVAL;
 	}
-	up_write(&gc_lock);
 
 	return ret;
 }

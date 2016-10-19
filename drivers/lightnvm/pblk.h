@@ -48,11 +48,11 @@
 
 enum {
 	/* IO Types */
-	PBLK_IOTYPE_NONE = 0,
-	PBLK_IOTYPE_GC = 1,
-	PBLK_IOTYPE_SYNC = 2,
-	PBLK_IOTYPE_CLOSE_BLK = 4,
-	PBLK_IOTYPE_REF = 8,
+	PBLK_IOTYPE_USER = 1,
+	PBLK_IOTYPE_GC = 2,
+	PBLK_IOTYPE_SYNC = 4,
+	PBLK_IOTYPE_CLOSE_BLK = 8,
+	PBLK_IOTYPE_REF = 16,
 
 	/* Write buffer flags */
 	PBLK_WRITTEN_DATA = 128,
@@ -271,23 +271,39 @@ struct pblk_lun {
 	spinlock_t lock;
 };
 
-/* Calculated values for GC thresholding. These are used to regulate user I/O
- * based on disk utilization and the necessity of GC
- *
- * TODO: user_io_rate should be used by the rate limiter to control the flow of
- * incoming user I/Os.
- */
-struct pblk_gc_thresholds {
-	unsigned long *emergency_luns;
-	unsigned int emergency;
-	int user_io_rate;
+struct pblk_gc {
+	int gc_active;
+	int gc_enabled;
+	int gc_forced;
+
 	spinlock_t lock;
 };
 
-struct pblk_rate_limiter {
-	int rb_user_max;	/* Max buffer entries available for user I/O */
+struct pblk_prov {
 
-	atomic_t rb_user_cnt;
+	/* High thresholds: user I/O free run */
+	unsigned int high;
+	unsigned int high_lun;
+
+	/* Low threshold: user I/O stall */
+	unsigned int low;
+	unsigned int low_lun;
+
+#define PBLK_USER_LOW_THRS 50	/* full stop at 2 percent of available
+				 * blocks
+				 */
+#define PBLK_USER_HIGH_THRS 4	/* begin write limit at 25 percent
+				 * available blks
+				 */
+
+	int rb_user_max;	/* Max buffer entries available for user I/O */
+	int rb_user_cnt;	/* user I/O buffer counter */
+
+	unsigned long long nr_secs;
+	unsigned long total_blocks;
+	unsigned long free_blocks;
+
+	spinlock_t lock;
 };
 
 struct pblk_prov_queue {
@@ -333,10 +349,6 @@ struct pblk {
 
 	struct pblk_w_luns w_luns;
 
-	/* calculated values */
-	unsigned long long nr_secs;
-	unsigned long total_blocks;
-
 	struct pblk_rb rwb;
 
 	int min_write_pgs; /* minimum amount of pages required by controller */
@@ -352,21 +364,12 @@ struct pblk {
 	/* capacity of devices when bad blocks are subtracted */
 	sector_t capacity;
 
-	struct pblk_rate_limiter rl;
+	/* pblk provisioning values. Used by rate limiter */
+	struct pblk_prov rl;
 
 	/* counter for pblk_write_kick */
 #define PBLK_KICK_SECTS 16
 	int write_cnt;
-
-	/* User write control */
-#define PBLK_USER_LOW_THRS 50	/* full stop at 2 percent of available
-				 * blocks
-				 */
-#define PBLK_USER_HIGH_THRS 4	/* begin write limit at 25 percent
-				 * available blks
-				 */
-	int write_cur_speed;
-	int write_max_speed;
 
 	atomic_t inflight_user;		/* Inflight user writes */
 
@@ -427,7 +430,7 @@ struct pblk {
 	wait_queue_head_t wait2;
 	struct timer_list wtimer;
 
-	struct pblk_gc_thresholds gc_ths;
+	struct pblk_gc gc;
 };
 
 struct pblk_block_ws {
@@ -511,7 +514,6 @@ struct pblk_blk_rec_lpg *pblk_alloc_blk_meta(struct pblk *pblk,
 					     struct pblk_block *rblk,
 					     u32 status);
 void pblk_put_blk(struct pblk *pblk, struct pblk_block *rblk);
-void pblk_put_blk_unlocked(struct pblk *pblk, struct pblk_block *rblk);
 void pblk_erase_blk(struct pblk *pblk, struct pblk_block *rblk);
 void pblk_end_io(struct nvm_rq *rqd);
 void pblk_end_sync_bio(struct bio *bio);
@@ -533,6 +535,7 @@ int pblk_update_map(struct pblk *pblk, sector_t laddr, struct pblk_block *rblk,
 int pblk_update_map_gc(struct pblk *pblk, sector_t laddr,
 		       struct pblk_block *rblk, struct ppa_addr ppa,
 		       struct pblk_block *gc_rblk);
+unsigned long pblk_nr_free_blks(struct pblk *pblk);
 
 /* pblk user I/O write path */
 int pblk_write_to_cache(struct pblk *pblk, struct bio *bio,
@@ -609,25 +612,28 @@ ssize_t pblk_recov_blk_meta_sysfs(struct pblk *pblk, const char *buf, int len);
 
 int pblk_gc_init(struct pblk *pblk);
 void pblk_gc_exit(struct pblk *pblk);
+void pblk_gc_should_start(struct pblk *pblk);
+void pblk_gc_should_stop(struct pblk *pblk);
+int pblk_gc_status(struct pblk *pblk);
 void pblk_gc_queue(struct work_struct *work);
 void pblk_gc(struct work_struct *work);
 int pblk_gc_move_valid_secs(struct pblk *pblk, struct pblk_block *rblk,
 			    u64 *lba_list, unsigned int nr_entries);
-void pblk_gc_check_emergency_in(struct pblk *pblk, struct pblk_lun *rlun);
-void pblk_gc_check_emergency_out(struct pblk *pblk, struct pblk_lun *rlun);
-int pblk_gc_is_emergency(struct pblk *pblk);
-int pblk_gc_sysfs_active_show(struct pblk *pblk);
+void pblk_gc_sysfs_state_show(struct pblk *pblk, int *gc_enabled,
+			      int *gc_active);
 int pblk_gc_sysfs_force(struct pblk *pblk, int value);
-int pblk_gc_sysfs_active_store(struct pblk *pblk, int value);
+int pblk_gc_sysfs_enable(struct pblk *pblk, int value);
 
 /* pblk rate limiter */
 void pblk_rl_init(struct pblk *pblk);
 int pblk_rl_calc_max_wr_speed(struct pblk *pblk);
-void pblk_rl_rate_user_io(struct pblk *pblk, int nr_entries);
-void pblk_rl_rate_gc_io(struct pblk *pblk, int nr_entries);
-void pblk_rl_update_rates(struct pblk *pblk);
+int pblk_rl_gc_thrs(struct pblk *pblk);
+void pblk_rl_user_in(struct pblk *pblk, int nr_entries);
+void pblk_rl_user_out(struct pblk *pblk, int nr_entries);
 int pblk_rl_sysfs_rate_show(struct pblk *pblk);
 int pblk_rl_sysfs_rate_store(struct pblk *pblk, int value);
+void pblk_rl_free_blks_inc(struct pblk *pblk, struct pblk_lun *rlun);
+void pblk_rl_free_blks_dec(struct pblk *pblk, struct pblk_lun *rlun);
 
 void pblk_print_failed_rqd(struct pblk *pblk, struct nvm_rq *rqd, int error);
 

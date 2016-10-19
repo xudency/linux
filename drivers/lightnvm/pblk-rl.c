@@ -17,58 +17,20 @@
 
 #include "pblk.h"
 
-/*
- * Increment 'v', if 'v' is below 'below'. Returns true if we succeeded,
- * false if 'v' + 1 would be bigger than 'below'.
- */
-static bool atomic_inc_below(atomic_t *v, int below, int inc)
-{
-	int cur = atomic_read(v);
-
-	for (;;) {
-		int old;
-
-		if (cur + inc > below)
-			return false;
-		old = atomic_cmpxchg(v, cur, cur + inc);
-		if (likely(old == cur))
-			break;
-		cur = old;
-	}
-
-	return true;
-}
-
-static inline bool __pblk_rl_rate_user_bw(struct pblk *pblk, int nr_entries)
-{
-	return atomic_inc_below(&pblk->inflight_user, pblk->write_cur_speed,
-								nr_entries);
-}
-
-static void pblk_rl_rate_user_bw(struct pblk *pblk, int nr_entries)
-{
-	DEFINE_WAIT(wait);
-
-	if (__pblk_rl_rate_user_bw(pblk, nr_entries))
-		return;
-
-	do {
-		prepare_to_wait_exclusive(&pblk->wait, &wait,
-						TASK_UNINTERRUPTIBLE);
-
-		if (__pblk_rl_rate_user_bw(pblk, nr_entries))
-			break;
-
-		io_schedule();
-	} while (1);
-
-	finish_wait(&pblk->wait, &wait);
-}
-
 static inline bool __pblk_rl_rate_user_rb(struct pblk *pblk, int nr_entries)
 {
-	return atomic_inc_below(&pblk->rl.rb_user_cnt, pblk->rl.rb_user_max,
-								nr_entries);
+	struct pblk_prov *rl = &pblk->rl;
+
+	spin_lock(&rl->lock);
+	if (rl->rb_user_cnt + nr_entries > rl->rb_user_max) {
+		spin_unlock(&rl->lock);
+		return false;
+	}
+
+	rl->rb_user_cnt += nr_entries;
+	spin_unlock(&rl->lock);
+
+	return true;
 }
 
 static void pblk_rl_rate_user_rb(struct pblk *pblk, int nr_entries)
@@ -91,44 +53,98 @@ static void pblk_rl_rate_user_rb(struct pblk *pblk, int nr_entries)
 	finish_wait(&pblk->wait2, &wait);
 }
 
-void pblk_rl_rate_user_io(struct pblk *pblk, int nr_entries)
+void pblk_rl_user_in(struct pblk *pblk, int nr_entries)
 {
 	/* pblk_rl_rate_user_bw(pblk, nr_entries); */
 	pblk_rl_rate_user_rb(pblk, nr_entries);
 }
 
-void pblk_rl_rate_gc_io(struct pblk *pblk, int nr_entries)
+void pblk_rl_user_out(struct pblk *pblk, int nr_entries)
 {
+	struct pblk_prov *rl = &pblk->rl;
 
+	spin_lock(&rl->lock);
+	rl->rb_user_cnt -= nr_entries;
+	WARN_ON(rl->rb_user_cnt < 0);
+	spin_unlock(&rl->lock);
+
+	if (waitqueue_active(&pblk->wait2))
+		wake_up_all(&pblk->wait2);
 }
 
-void pblk_rl_update_rates(struct pblk *pblk)
+/*
+ * We check for (i) the number of free blocks in the current LUN and (ii) the
+ * total number of free blocks in the pblk instance. This is to even out the
+ * number of free blocks on each LUN when GC kicks in.
+ *
+ * Only the total number of free blocks is used to configure the rate limiter.
+ */
+static void pblk_rl_update_rates(struct pblk *pblk, struct pblk_lun *rlun)
 {
-	int i;
-	unsigned int avail = 0;
-	struct pblk_lun *rlun;
-	int high, low;
+	struct pblk_prov *rl = &pblk->rl;
+	unsigned long rwb_size = pblk_rb_nr_entries(&pblk->rwb);
+	int should_start_gc = 0, should_stop_gc = 0;
 
-	for (i = 0; i < pblk->nr_luns; i++) {
-		rlun = &pblk->luns[i];
-		spin_lock(&rlun->lock);
-		avail += rlun->mgmt->nr_free_blocks;
-		spin_unlock(&rlun->lock);
-	}
+#if CONFIG_NVM_DEBUG
+	lockdep_assert_held(&rl->lock);
+#endif
 
-	high = pblk->total_blocks / PBLK_USER_HIGH_THRS;
-	low = pblk->total_blocks / PBLK_USER_LOW_THRS;
+	if (rlun->mgmt->nr_free_blocks > rl->high_lun)
+			should_stop_gc = 1;
+	else if (rlun->mgmt->nr_free_blocks < rl->low_lun)
+			should_start_gc = 1;
 
-	if (avail > high)
-		pblk->write_cur_speed = pblk->write_max_speed;
-	else if (avail > low && avail < high)
-	{
-		/* redo to power of two calculations */
-		int perc = ((avail * 100)) / (high - low);
-		pblk->write_cur_speed = (pblk->write_max_speed / 100) * perc;
+	if (rl->free_blocks >= rl->high) {
+		rl->rb_user_max = rwb_size;
+		should_stop_gc = 1;
+	} else if (rl->free_blocks > rl->low && rl->free_blocks < rl->high) {
+		/* TODO: redo to power of two calculations */
+		int perc = ((rl->free_blocks * 100) / (rl->high - rl->low));
+
+		rl->rb_user_max = (rwb_size / 100) * perc;
+		should_start_gc = 1;
 	} else {
-		pblk->write_cur_speed = 0;
+		rl->rb_user_max = 0;
+		should_start_gc = 1;
 	}
+
+	if (should_start_gc)
+		pblk_gc_should_start(pblk);
+	else if (should_stop_gc)
+		pblk_gc_should_stop(pblk);
+}
+
+void pblk_rl_free_blks_inc(struct pblk *pblk, struct pblk_lun *rlun)
+{
+#if CONFIG_NVM_DEBUG
+	lockdep_assert_held(&rlun->lock);
+#endif
+
+	rlun->mgmt->nr_free_blocks++;
+
+	spin_lock(&pblk->rl.lock);
+	pblk->rl.free_blocks++;
+	pblk_rl_update_rates(pblk, rlun);
+	spin_unlock(&pblk->rl.lock);
+}
+
+void pblk_rl_free_blks_dec(struct pblk *pblk, struct pblk_lun *rlun)
+{
+#if CONFIG_NVM_DEBUG
+	lockdep_assert_held(&rlun->lock);
+#endif
+
+	rlun->mgmt->nr_free_blocks--;
+
+	spin_lock(&pblk->rl.lock);
+	pblk->rl.free_blocks--;
+	pblk_rl_update_rates(pblk, rlun);
+	spin_unlock(&pblk->rl.lock);
+}
+
+int pblk_rl_gc_thrs(struct pblk *pblk)
+{
+	return pblk->rl.high_lun + 1;
 }
 
 int pblk_rl_calc_max_wr_speed(struct pblk *pblk)
@@ -155,12 +171,24 @@ int pblk_rl_sysfs_rate_store(struct pblk *pblk, int value)
 	return 0;
 }
 
+/* TODO: Update values correctly on power up recovery */
 void pblk_rl_init(struct pblk *pblk)
 {
-	struct pblk_rate_limiter *rl = &pblk->rl;
+	struct pblk_prov *rl = &pblk->rl;
+
+	rl->free_blocks = pblk_nr_free_blks(pblk);
+
+	rl->high = rl->total_blocks / PBLK_USER_HIGH_THRS;
+	rl->high_lun = pblk->dev->blks_per_lun / PBLK_USER_HIGH_THRS;
+	rl->low = rl->total_blocks / PBLK_USER_LOW_THRS;
+	rl->low_lun = pblk->dev->blks_per_lun / PBLK_USER_LOW_THRS;
+	if (rl->low_lun < 3)
+		rl->low_lun = 3;
 
 	/* To start with, all buffer is available to user I/O writers */
 	rl->rb_user_max = pblk_rb_nr_entries(&pblk->rwb);
-	atomic_set(&rl->rb_user_cnt, 0);
+	rl->rb_user_cnt = 0;
+
+	spin_lock_init(&rl->lock);
 }
 

@@ -146,9 +146,6 @@ void pblk_write_timer_fn(unsigned long data)
 	/* kick the write thread every tick to flush outstanding data */
 	pblk_write_kick(pblk);
 
-	/* write user and gc I/O rate*/
-	/* pblk_rl_update_rates(pblk); */
-
 	mod_timer(&pblk->wtimer, jiffies + msecs_to_jiffies(1000));
 }
 
@@ -301,7 +298,7 @@ struct nvm_block *__pblk_get_blk(struct pblk *pblk, struct pblk_lun *rlun)
 
 	list_move_tail(&blk->list, &rlun->mgmt->used_list);
 	blk->state = NVM_BLK_ST_TGT;
-	rlun->mgmt->nr_free_blocks--;
+	pblk_rl_free_blks_dec(pblk, rlun);
 out:
 	return blk;
 }
@@ -425,7 +422,7 @@ int pblk_update_map(struct pblk *pblk, sector_t laddr, struct pblk_block *rblk,
 		pblk_rb_pos_oob(&pblk->rwb, nvm_addr_to_cacheline(ppa)));
 #endif
 
-	BUG_ON(laddr >= pblk->nr_secs);
+	BUG_ON(laddr >= pblk->rl.nr_secs);
 
 	spin_lock(&pblk->trans_lock);
 	gp = &pblk->trans_map[laddr];
@@ -447,7 +444,7 @@ int pblk_update_map_gc(struct pblk *pblk, sector_t laddr,
 	struct pblk_addr *gp;
 	int ret = 0;
 
-	BUG_ON(laddr >= pblk->nr_secs);
+	BUG_ON(laddr >= pblk->rl.nr_secs);
 
 	spin_lock(&pblk->trans_lock);
 	gp = &pblk->trans_map[laddr];
@@ -620,6 +617,22 @@ static void pblk_free_blk_meta(struct pblk *pblk, struct pblk_block *rblk)
 	mempool_free(rblk->rlpg, pblk->blk_meta_pool);
 }
 
+unsigned long pblk_nr_free_blks(struct pblk *pblk)
+{
+	int i;
+	unsigned int avail = 0;
+	struct pblk_lun *rlun;
+
+	for (i = 0; i < pblk->nr_luns; i++) {
+		rlun = &pblk->luns[i];
+		spin_lock(&rlun->lock);
+		avail += rlun->mgmt->nr_free_blocks;
+		spin_unlock(&rlun->lock);
+	}
+
+	return avail;
+}
+
 /*
  * TODO: For now, we pad the whole block. In the future, pad only the pages that
  * are needed to guarantee that future reads will come, and delegate bringing up
@@ -653,7 +666,7 @@ void pblk_pad_open_blks(struct pblk *pblk)
 
 			/* empty block - no need for padding */
 			if (nr_free_secs == pblk->nr_blk_dsecs) {
-				pblk_put_blk_unlocked(pblk, rblk);
+				pblk_put_blk(pblk, rblk);
 				continue;
 			}
 
@@ -705,7 +718,7 @@ void __pblk_put_blk(struct pblk *pblk, struct pblk_block *rblk)
 	spin_lock(&rlun->lock);
 	if (blk->state & NVM_BLK_ST_TGT) {
 		list_move_tail(&blk->list, &rlun->mgmt->free_list);
-		rlun->mgmt->nr_free_blocks++;
+		pblk_rl_free_blks_inc(pblk, rlun);
 		blk->state = NVM_BLK_ST_FREE;
 	} else if (blk->state & NVM_BLK_ST_BAD) {
 		list_move_tail(&blk->list, &rlun->mgmt->bb_list);
@@ -719,20 +732,17 @@ void __pblk_put_blk(struct pblk *pblk, struct pblk_block *rblk)
 	spin_unlock(&rlun->lock);
 }
 
-void pblk_put_blk_unlocked(struct pblk *pblk, struct pblk_block *rblk)
-{
-	nvm_put_blk(pblk->dev, rblk->parent);
-	list_del(&rblk->list);
-	pblk_free_blk_meta(pblk, rblk);
-}
-
 void pblk_put_blk(struct pblk *pblk, struct pblk_block *rblk)
 {
 	struct pblk_lun *rlun = rblk->rlun;
 
+	__pblk_put_blk(pblk, rblk);
+
 	spin_lock(&rlun->lock_lists);
-	pblk_put_blk_unlocked(pblk, rblk);
+	list_del(&rblk->list);
 	spin_unlock(&rlun->lock_lists);
+
+	pblk_free_blk_meta(pblk, rblk);
 }
 
 void pblk_erase_blk(struct pblk *pblk, struct pblk_block *rblk)

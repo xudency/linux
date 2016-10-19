@@ -263,12 +263,10 @@ int pblk_map_rr_page(struct pblk *pblk, unsigned int sentry,
 	struct pblk_block *rblk;
 	struct pblk_lun *rlun;
 	int lun_pos;
-	int gen_emergency_gc;
 	int ret = 0;
 
 try_lun:
-	gen_emergency_gc = pblk_gc_is_emergency(pblk);
-	rlun = pblk_map_get_lun_rr(pblk, &lun_pos, gen_emergency_gc);
+	rlun = pblk_map_get_lun_rr(pblk, &lun_pos, pblk_gc_status(pblk));
 	spin_lock(&rlun->lock);
 
 try_cur:
