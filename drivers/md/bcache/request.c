@@ -388,6 +388,9 @@ static bool check_should_bypass(struct cached_dev *dc, struct bio *bio)
 	     op_is_write(bio_op(bio))))
 		goto skip;
 
+	if (bio->bi_opf & (REQ_RAHEAD|REQ_BACKGROUND))
+		goto skip;
+
 	/* If the ioprio already exists on the bio, use that.  We assume that
 	 * the upper layer properly assigned the calling process's ioprio to
 	 * the bio being passed to bcache. Otherwise, use current's ioc. */
