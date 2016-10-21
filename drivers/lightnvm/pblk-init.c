@@ -444,6 +444,23 @@ static void pblk_area_free(struct pblk *pblk)
 	mt->put_area(dev, pblk->soffset);
 }
 
+static int pblk_writer_init(struct pblk *pblk)
+{
+	setup_timer(&pblk->wtimer, pblk_write_timer_fn, (unsigned long)pblk);
+	mod_timer(&pblk->wtimer, jiffies + msecs_to_jiffies(100));
+
+	pblk->ts_writer = kthread_create(pblk_write_ts, pblk, "pblk-writer");
+	pblk_rl_init(pblk);
+
+	return 0;
+}
+
+static void pblk_writer_free(struct pblk *pblk)
+{
+	kthread_stop(pblk->ts_writer);
+	del_timer(&pblk->wtimer);
+}
+
 static void pblk_free(struct pblk *pblk)
 {
 	pblk_l2p_free(pblk);
@@ -451,6 +468,8 @@ static void pblk_free(struct pblk *pblk)
 	pblk_luns_free(pblk);
 	pblk_area_free(pblk);
 	pblk_map_free(pblk);
+	pblk_writer_free(pblk);
+	pblk_rwb_free(pblk);
 
 	kfree(pblk);
 }
@@ -458,13 +477,8 @@ static void pblk_free(struct pblk *pblk)
 static void pblk_tear_down(struct pblk *pblk)
 {
 	pblk_flush_writer(pblk);
-
-	del_timer(&pblk->wtimer);
-	kthread_stop(pblk->ts_writer);
-
 	pblk_pad_open_blks(pblk);
 	pblk_rb_sync_l2p(&pblk->rwb);
-	pblk_rwb_free(pblk);
 
 	if (pblk_rb_tear_down_check(&pblk->rwb)) {
 		pr_err("pblk: write buffer error on tear down\n");
@@ -1384,7 +1398,6 @@ static void *pblk_init(struct nvm_dev *dev, struct gendisk *tdisk,
 	spin_lock_init(&pblk->lock);
 	INIT_WORK(&pblk->ws_requeue, pblk_requeue);
 	INIT_WORK(&pblk->ws_gc, pblk_gc);
-	pblk->ts_writer = kthread_create(pblk_write_ts, pblk, "pblk-writer");
 
 	pblk->nr_luns = lun_end - lun_begin + 1;
 
@@ -1446,7 +1459,11 @@ static void *pblk_init(struct nvm_dev *dev, struct gendisk *tdisk,
 		goto err;
 	}
 
-	pblk_rl_init(pblk);
+	ret = pblk_writer_init(pblk);
+	if (ret) {
+		pr_err("pblk: could not initialize write thread\n");
+		goto err;
+	}
 
 	ret = pblk_luns_configure(pblk);
 	if (ret) {
@@ -1469,9 +1486,6 @@ static void *pblk_init(struct nvm_dev *dev, struct gendisk *tdisk,
 	pr_info("pblk init: luns:%u, %llu sectors, buffer entries:%lu\n",
 			pblk->nr_luns, (unsigned long long)pblk->rl.nr_secs,
 			pblk_rb_nr_entries(&pblk->rwb));
-
-	setup_timer(&pblk->wtimer, pblk_write_timer_fn, (unsigned long)pblk);
-	mod_timer(&pblk->wtimer, jiffies + msecs_to_jiffies(100));
 
 	wake_up_process(pblk->ts_writer);
 	return pblk;
