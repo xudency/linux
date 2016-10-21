@@ -328,10 +328,12 @@ static int pblk_luns_init(struct pblk *pblk, int lun_begin, int lun_end)
 	struct nvm_dev *dev = pblk->dev;
 	struct pblk_lun *rlun;
 	int i, j, mod, ret = -EINVAL;
+	int max_write_ppas;
 
 	pblk->min_write_pgs = dev->sec_per_pl * (dev->sec_size / PAGE_SIZE);
-	pblk->max_write_pgs = dev->ops->max_phys_sect;
-
+	max_write_ppas = pblk->min_write_pgs * pblk->nr_luns;
+	pblk->max_write_pgs = (max_write_ppas < dev->ops->max_phys_sect) ?
+				max_write_ppas : dev->ops->max_phys_sect;
 
 	if (pblk->max_write_pgs > PBLK_MAX_REQ_ADDRS) {
 		pr_err("pblk: device exposes too many sectors per write");
