@@ -206,8 +206,8 @@ struct pblk_blk_rec_lpg {
 };
 
 struct pblk_blk_rec_lenghts {
-	u32 bitmap_len;
-	u32 rlpg_page_len;
+	unsigned int bitmap_len;
+	unsigned int rlpg_page_len;
 };
 
 struct pblk_block {
@@ -588,7 +588,7 @@ void pblk_end_io_read(struct pblk *pblk, struct nvm_rq *rqd, uint8_t nr_secs);
 void pblk_submit_rec(struct work_struct *work);
 int pblk_recov_page_size(struct pblk *pblk);
 void pblk_run_recovery(struct pblk *pblk, struct pblk_block *rblk);
-unsigned int pblk_recov_init(struct pblk *pblk);
+int pblk_recov_init(struct pblk *pblk);
 int pblk_recov_setup_rq(struct pblk *pblk, struct pblk_ctx *ctx,
 			struct pblk_rec_ctx *recovery, u64 *comp_bits,
 			unsigned int c_entries);

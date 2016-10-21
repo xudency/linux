@@ -89,6 +89,9 @@ static int pblk_setup_rec_rq(struct pblk *pblk, struct nvm_rq *rqd,
 	int min = pblk->min_write_pgs;
 	int i;
 	int ret = 0;
+#ifdef CONFIG_NVM_DEBUG
+	struct ppa_addr *ppa_list;
+#endif
 
 	ret = pblk_write_alloc_rq(pblk, rqd, ctx, nr_rec_secs);
 	if (ret)
@@ -126,6 +129,7 @@ static int pblk_setup_rec_rq(struct pblk *pblk, struct nvm_rq *rqd,
 	rqd->flags = pblk_set_progr_mode(pblk, WRITE);
 
 #ifdef CONFIG_NVM_DEBUG
+	ppa_list = (rqd->nr_ppas > 1) ? rqd->ppa_list : &rqd->ppa_addr;
 	if (nvm_boundary_checks(pblk->dev, rqd->ppa_list, rqd->nr_ppas))
 		WARN_ON(1);
 #endif
@@ -311,6 +315,7 @@ int pblk_recov_read(struct pblk *pblk, struct pblk_block *rblk,
 		    void *recov_page)
 {
 	struct nvm_dev *dev = pblk->dev;
+	unsigned int nr_rec_ppas = dev->sec_per_blk - pblk->nr_blk_dsecs;
 	struct ppa_addr ppa_addr[PBLK_RECOVERY_SECTORS];
 	struct nvm_rq *rqd;
 	struct bio *bio;
@@ -318,6 +323,9 @@ int pblk_recov_read(struct pblk *pblk, struct pblk_block *rblk,
 	int i;
 	int ret = 0;
 	DECLARE_COMPLETION_ONSTACK(wait);
+#ifdef CONFIG_NVM_DEBUG
+	struct ppa_addr *ppa_list;
+#endif
 
 	rqd = pblk_recov_setup(pblk, recov_page);
 	if (!rqd)
@@ -327,20 +335,21 @@ int pblk_recov_read(struct pblk *pblk, struct pblk_block *rblk,
 	bio->bi_private = &wait;
 
 	/* Last page in block contains mapped lba list if block is closed */
-	for (i = 0; i < PBLK_RECOVERY_SECTORS; i++) {
+	for (i = 0; i < nr_rec_ppas; i++) {
 		rppa = pblk->nr_blk_dsecs + i;
 		ppa_addr[i] = pblk_ppa_to_gaddr(dev,
 					global_addr(pblk, rblk, rppa));
 	}
 
-	if (nvm_set_rqd_ppalist(dev, rqd, ppa_addr, PBLK_RECOVERY_SECTORS, 0)) {
+	if (nvm_set_rqd_ppalist(dev, rqd, ppa_addr, nr_rec_ppas, 0)) {
 		pr_err("pblk: not able to set rqd ppa list\n");
 		ret = -1;
 		goto free_rqd;
 	}
 
 #ifdef CONFIG_NVM_DEBUG
-	if (nvm_boundary_checks(dev, rqd->ppa_list, rqd->nr_ppas))
+	ppa_list = (rqd->nr_ppas > 1) ? rqd->ppa_list : &rqd->ppa_addr;
+	if (nvm_boundary_checks(dev, ppa_list, rqd->nr_ppas))
 		WARN_ON(1);
 #endif
 
@@ -413,17 +422,19 @@ u64 *pblk_recov_get_lba_list(struct pblk *pblk, struct pblk_blk_rec_lpg *rlpg)
 }
 
 /* TODO: Fit lba in u32 when possible to fit metadata in one page */
-unsigned int pblk_recov_init(struct pblk *pblk)
+int pblk_recov_init(struct pblk *pblk)
 {
 	struct nvm_dev *dev = pblk->dev;
 	unsigned int nr_blk_dsecs;
 	unsigned int rlpg_len;
-	u32 bitmap_len, rlpg_page_len;
+	unsigned int bitmap_len, rlpg_page_len;
+	unsigned int nr_rec_ppas;
 	int i = 1;
 
 retry:
-	nr_blk_dsecs = dev->sec_per_blk - (i * dev->sec_per_pl);
-	rlpg_page_len = i * dev->sec_per_pl * dev->sec_size;
+	nr_rec_ppas = i * dev->sec_per_pl;
+	nr_blk_dsecs = dev->sec_per_blk - nr_rec_ppas;
+	rlpg_page_len = nr_rec_ppas * dev->sec_size;
 	bitmap_len =  BITS_TO_LONGS(nr_blk_dsecs) * sizeof(unsigned long);
 	rlpg_len = calc_rlpg_len(nr_blk_dsecs, bitmap_len);
 
@@ -432,10 +443,16 @@ retry:
 		goto retry;
 	}
 
+	if (nr_rec_ppas > PBLK_RECOVERY_SECTORS) {
+		pr_err("pblk: Not enough recovery sectors for NAND config.\n");
+		return -EINVAL;
+	}
+
 	pblk->blk_meta.rlpg_page_len = rlpg_page_len;
 	pblk->blk_meta.bitmap_len = bitmap_len;
+	pblk->nr_blk_dsecs = nr_blk_dsecs;
 
-	return nr_blk_dsecs;
+	return 0;
 }
 
 /*
@@ -494,10 +511,13 @@ int pblk_recov_scan_blk(struct pblk *pblk, struct pblk_block *rblk)
 	bppa = global_addr(pblk, rblk, 0);
 	for (i = 0; i < pblk->nr_blk_dsecs; i++) {
 		ppa = pblk_ppa_to_gaddr(dev, bppa + i);
-		if (lba_list[i] != ADDR_EMPTY &&
-					!nvm_boundary_checks(dev, &ppa, 1)) {
+		if (lba_list[i] != ADDR_EMPTY)
 			pblk_update_map(pblk, lba_list[i], rblk, ppa);
-		}
+
+#ifdef CONFIG_NVM_DEBUG
+		if (nvm_boundary_checks(dev, &ppa, 1))
+			WARN_ON(1);
+#endif
 		/*TODO: when not padding the whole block, mark as invalid */
 	}
 
@@ -606,27 +626,32 @@ void __pblk_close_rblk(struct pblk *pblk, struct pblk_block *rblk,
 	struct nvm_dev *dev = pblk->dev;
 	struct ppa_addr ppa_addr[PBLK_RECOVERY_SECTORS];
 	int nr_entries = pblk->nr_blk_dsecs;
+	unsigned int nr_rec_ppas = dev->sec_per_blk - nr_entries;
 	u64 paddr;
 	int i;
+#ifdef CONFIG_NVM_DEBUG
+	struct ppa_addr *ppa_list;
+#endif
 
 	/* address within a block for the last writable page */
-	for (i = 0; i < PBLK_RECOVERY_SECTORS; i++) {
+	for (i = 0; i < nr_rec_ppas; i++) {
 		paddr = nr_entries + i;
 		ppa_addr[i] = pblk_ppa_to_gaddr(dev,
 					global_addr(pblk, rblk, paddr));
 	}
 
 	/* TODO: This is unnecessary - directly copy to ppa_list buffer */
-	if (nvm_set_rqd_ppalist(dev, rqd, ppa_addr, PBLK_RECOVERY_SECTORS, 0)) {
+	if (nvm_set_rqd_ppalist(dev, rqd, ppa_addr, nr_rec_ppas, 0)) {
 		pr_err("pblk: not able to set rqd ppa list\n");
 		goto fail_set_rqd;
 	}
 
 #ifdef CONFIG_NVM_DEBUG
-	if (nvm_boundary_checks(dev, rqd->ppa_list, rqd->nr_ppas))
+	ppa_list = (rqd->nr_ppas > 1) ? rqd->ppa_list : &rqd->ppa_addr;
+	if (nvm_boundary_checks(dev, ppa_list, rqd->nr_ppas))
 		WARN_ON(1);
 
-	BUG_ON(rqd->nr_ppas != PBLK_RECOVERY_SECTORS);
+	BUG_ON(rqd->nr_ppas != nr_rec_ppas);
 	atomic_add(rqd->nr_ppas, &pblk->inflight_meta);
 #endif
 
@@ -680,9 +705,11 @@ void pblk_close_blk(struct work_struct *work)
 ssize_t pblk_recov_blk_meta_sysfs(struct pblk *pblk, const char *buf, int len)
 {
 	struct nvm_dev *dev = pblk->dev;
+	unsigned int nr_rec_ppas = dev->sec_per_blk - pblk->nr_blk_dsecs;
 	size_t c_len;
 	struct ppa_addr bppa;
 	struct ppa_addr ppas[PBLK_RECOVERY_SECTORS];
+	struct ppa_addr *ppa_list;
 	struct pblk_blk_rec_lpg *rlpg;
 	struct nvm_rq *rqd;
 	struct bio *bio;
@@ -716,7 +743,7 @@ ssize_t pblk_recov_blk_meta_sysfs(struct pblk *pblk, const char *buf, int len)
 	bio->bi_private = &wait;
 
 	bppa.g.pg = 255;
-	for (i = 0; i < PBLK_RECOVERY_SECTORS; i++) {
+	for (i = 0; i < nr_rec_ppas; i++) {
 		struct ppa_addr ppa = bppa;
 
 		ppa.g.pl = i / 4;
@@ -725,15 +752,16 @@ ssize_t pblk_recov_blk_meta_sysfs(struct pblk *pblk, const char *buf, int len)
 		ppas[i] = ppa;
 	}
 
-	if (nvm_set_rqd_ppalist(dev, rqd, ppas, PBLK_RECOVERY_SECTORS, 0)) {
+	if (nvm_set_rqd_ppalist(dev, rqd, ppas, nr_rec_ppas, 0)) {
 		pr_err("pblk: could not set rqd ppa list\n");
 		goto out;
 	}
 
-	for (i = 0; i < PBLK_RECOVERY_SECTORS; i++)
+	for (i = 0; i < nr_rec_ppas; i++)
 		print_ppa(&rqd->ppa_list[i], "RECOVERY", i);
 
-	if (nvm_boundary_checks(dev, rqd->ppa_list, rqd->nr_ppas)) {
+	ppa_list = (rqd->nr_ppas > 1) ? rqd->ppa_list : &rqd->ppa_addr;
+	if (nvm_boundary_checks(dev, ppa_list, rqd->nr_ppas)) {
 		pr_err("pblk: corrupt ppa list\n");
 		goto out;
 	}

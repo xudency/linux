@@ -76,7 +76,7 @@ void pblk_print_failed_rqd(struct pblk *pblk, struct nvm_rq *rqd, int error)
 		print_ppa(&p, "rqd", error);
 	}
 
-	pr_err("ppa_status:%llx\n", rqd->ppa_status);
+	pr_err("error:%d, ppa_status:%llx\n", error, rqd->ppa_status);
 }
 
 void pblk_bio_free_pages(struct pblk *pblk, struct bio *bio, int off,

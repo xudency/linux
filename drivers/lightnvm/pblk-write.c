@@ -104,6 +104,9 @@ static int pblk_setup_w_rq(struct pblk *pblk, struct nvm_rq *rqd,
 	int min = pblk->min_write_pgs;
 	int i;
 	int ret = 0;
+#ifdef CONFIG_NVM_DEBUG
+	struct ppa_addr *ppa_list;
+#endif
 
 	ret = pblk_write_alloc_rq(pblk, rqd, ctx, nr_secs);
 	if (ret)
@@ -126,7 +129,8 @@ static int pblk_setup_w_rq(struct pblk *pblk, struct nvm_rq *rqd,
 	}
 
 #ifdef CONFIG_NVM_DEBUG
-	if (nvm_boundary_checks(pblk->dev, rqd->ppa_list, rqd->nr_ppas))
+	ppa_list = (rqd->nr_ppas > 1) ? rqd->ppa_list : &rqd->ppa_addr;
+	if (nvm_boundary_checks(pblk->dev, ppa_list, rqd->nr_ppas))
 		WARN_ON(1);
 #endif
 

@@ -333,6 +333,11 @@ static int pblk_luns_init(struct pblk *pblk, int lun_begin, int lun_end)
 	pblk->max_write_pgs = dev->ops->max_phys_sect;
 
 
+	if (pblk->max_write_pgs > PBLK_MAX_REQ_ADDRS) {
+		pr_err("pblk: device exposes too many sectors per write");
+		return -EINVAL;
+	}
+
 	pblk->pgs_in_buffer = NVM_MEM_PAGE_WRITE * dev->sec_per_pg *
 				dev->nr_planes * pblk->nr_luns;
 
@@ -1417,7 +1422,11 @@ static void *pblk_init(struct nvm_dev *dev, struct gendisk *tdisk,
 		goto err;
 	}
 
-	pblk->nr_blk_dsecs = pblk_recov_init(pblk);
+	ret = pblk_recov_init(pblk);
+	if (ret) {
+		pr_err("pblk: could not initialize recovery\n");
+		goto err;
+	}
 
 	ret = pblk_core_init(pblk);
 	if (ret) {
