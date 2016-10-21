@@ -734,9 +734,9 @@ static ssize_t pblk_sysfs_write_max(struct pblk *pblk, char *page)
 	return sprintf(page, "wb:%u/%lu (stop:<%u/%u, fullspd:>%u/%u, avail:%lu)\n",
 				pblk->rl.rb_user_max,
 				pblk_rb_nr_entries(&pblk->rwb),
-				pblk->rl.low,
+				1 << pblk->rl.low_pw,
 				pblk->rl.low_lun,
-				pblk->rl.high,
+				1 << pblk->rl.high_pw,
 				pblk->rl.high_lun,
 				free_blocks);
 	return 0;

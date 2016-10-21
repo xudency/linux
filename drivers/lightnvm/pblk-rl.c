@@ -84,6 +84,8 @@ static void pblk_rl_update_rates(struct pblk *pblk, struct pblk_lun *rlun)
 	struct pblk_prov *rl = &pblk->rl;
 	unsigned long rwb_size = pblk_rb_nr_entries(&pblk->rwb);
 	int should_start_gc = 0, should_stop_gc = 0;
+	unsigned int high = 1 << rl->high_pw;
+	unsigned int low = 1 << rl->low_pw;
 
 #if CONFIG_NVM_DEBUG
 	lockdep_assert_held(&rl->lock);
@@ -94,14 +96,14 @@ static void pblk_rl_update_rates(struct pblk *pblk, struct pblk_lun *rlun)
 	else if (rlun->mgmt->nr_free_blocks < rl->low_lun)
 			should_start_gc = 1;
 
-	if (rl->free_blocks >= rl->high) {
+	if (rl->free_blocks >= high) {
 		rl->rb_user_max = rwb_size;
 		should_stop_gc = 1;
-	} else if (rl->free_blocks > rl->low && rl->free_blocks < rl->high) {
-		/* TODO: redo to power of two calculations */
-		int perc = ((rl->free_blocks * 100) / (rl->high - rl->low));
+	} else if (rl->free_blocks > low && rl->free_blocks < high) {
+		int shift = rl->high_pw - rl->rb_windows_pw;
+		int user_windows = rl->free_blocks >> shift;
 
-		rl->rb_user_max = (rwb_size / 100) * perc;
+		rl->rb_user_max = user_windows << PBLK_MAX_REQ_ADDRS_PW;
 		should_start_gc = 1;
 	} else {
 		rl->rb_user_max = 0;
@@ -175,15 +177,20 @@ int pblk_rl_sysfs_rate_store(struct pblk *pblk, int value)
 void pblk_rl_init(struct pblk *pblk)
 {
 	struct pblk_prov *rl = &pblk->rl;
+	unsigned int rb_windows;
 
 	rl->free_blocks = pblk_nr_free_blks(pblk);
 
-	rl->high = rl->total_blocks / PBLK_USER_HIGH_THRS;
+	rl->high_pw = get_count_order(rl->total_blocks / PBLK_USER_HIGH_THRS);
+	rl->low_pw = get_count_order(rl->total_blocks / PBLK_USER_LOW_THRS);
 	rl->high_lun = pblk->dev->blks_per_lun / PBLK_USER_HIGH_THRS;
-	rl->low = rl->total_blocks / PBLK_USER_LOW_THRS;
 	rl->low_lun = pblk->dev->blks_per_lun / PBLK_USER_LOW_THRS;
 	if (rl->low_lun < 3)
 		rl->low_lun = 3;
+
+	/* This will always be a power-of-2 */
+	rb_windows = pblk_rb_nr_entries(&pblk->rwb) / PBLK_MAX_REQ_ADDRS;
+	rl->rb_windows_pw = get_count_order(rb_windows);
 
 	/* To start with, all buffer is available to user I/O writers */
 	rl->rb_user_max = pblk_rb_nr_entries(&pblk->rwb);

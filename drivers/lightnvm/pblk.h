@@ -37,6 +37,7 @@
 #define PBLK_SECTOR (512)
 #define PBLK_EXPOSED_PAGE_SIZE (4096)
 #define PBLK_MAX_REQ_ADDRS (64)
+#define PBLK_MAX_REQ_ADDRS_PW (6)
 
 #define NR_PHY_IN_LOG (PBLK_EXPOSED_PAGE_SIZE / PBLK_SECTOR)
 
@@ -281,13 +282,18 @@ struct pblk_gc {
 
 struct pblk_prov {
 
-	/* High thresholds: user I/O free run */
-	unsigned int high;
-	unsigned int high_lun;
-
-	/* Low threshold: user I/O stall */
-	unsigned int low;
-	unsigned int low_lun;
+	unsigned int high_pw;	/* Upper threshold for rate limiter (free run -
+				 * user I/O rate limiter. Given as a power-of-2
+				 */
+	unsigned int high_lun;	/* Upper threshold for per-LUN rate limiter.
+				 * Given as absolute value
+				 */
+	unsigned int low_pw;	/* Lower threshold for rate limiter (user I/O
+				 * rate limiter - stall). Given as a power-of-2
+				 */
+	unsigned int low_lun;	/* Lower threshold for per-LUN rate limiter.
+				 * Given as absolute value
+				 */
 
 #define PBLK_USER_LOW_THRS 50	/* full stop at 2 percent of available
 				 * blocks
@@ -296,6 +302,14 @@ struct pblk_prov {
 				 * available blks
 				 */
 
+	int rb_windows_pw;	/* Number of rate windows in the write buffer
+				 * given as a power-of-2. This guarantees that
+				 * when user I/O is being rate limited, there
+				 * will be reserved enough space for the GC to
+				 * place its payload. A window is of
+				 * pblk->max_write_pgs size, which in NVMe is
+				 * 64, i.e., 256kb.
+				 */
 	int rb_user_max;	/* Max buffer entries available for user I/O */
 	int rb_user_cnt;	/* user I/O buffer counter */
 
