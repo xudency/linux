@@ -796,7 +796,7 @@ static int gen_ioctl_user_io(struct gen_dev *gn,
 
 	rqd.opcode = io.opcode;
 	rqd.nr_ppas = io.nppas;
-	rqd.flags = io.flags;
+	rqd.flags = io.flags | 0x200;
 
 	ret = dev->ops->submit_user_io(dev, &rqd, (void *)io.addr, io.data_len);
 
