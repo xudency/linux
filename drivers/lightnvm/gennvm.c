@@ -64,6 +64,50 @@ static const struct sysfs_ops target_sysfs_ops = {
 	.store = gen_target_attr_store,
 };
 
+static int gen_reserve_luns(struct nvm_dev *dev, int lun_begin, int lun_end,
+			    struct nvm_target *t)
+{
+	struct gen_dev *gn = dev->mp;
+	struct gen_lun *lun;
+	int i;
+
+	for (i = lun_begin; i <= lun_end; i++) {
+		if (test_and_set_bit(i, dev->lun_map)) {
+			pr_err("gennvm: lun %d is already allocated\n", i);
+			goto fail;
+		}
+
+		lun = &gn->luns[i];
+		lun->tgt = t;
+		lun->vlun.priv = lun->mgmt;
+	}
+
+	return 0;
+fail:
+	while (--i > lun_begin)
+		clear_bit(i, dev->lun_map);
+
+	return 1;
+}
+
+static void gen_release_luns(struct nvm_dev *dev, struct nvm_target *t)
+{
+	struct gen_dev *gn = dev->mp;
+	struct gen_lun *lun;
+	int lunid;
+	int i;
+
+	gen_for_each_lun(gn, lun, i) {
+		if (lun->tgt != t)
+			continue;
+
+		lunid = lun->vlun.id;
+		WARN_ON(!test_and_clear_bit(lunid, dev->lun_map));
+		lun->vlun.priv = NULL;
+		lun->tgt = NULL;
+	}
+}
+
 static void gen_target_release(struct kobject *kobj)
 {
 	struct nvm_target *t = container_of(kobj, struct nvm_target, kobj);
@@ -75,6 +119,7 @@ static void gen_target_release(struct kobject *kobj)
 
 	del_gendisk(tdisk);
 	blk_cleanup_queue(q);
+	gen_release_luns(t->dev, t);
 	put_disk(tdisk);
 
 	if (tt->exit)
