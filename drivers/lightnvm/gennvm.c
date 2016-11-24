@@ -482,12 +482,6 @@ static void gen_unregister(struct nvm_dev *dev)
 	module_put(THIS_MODULE);
 }
 
-enum {
-	TRANS_TGT_TO_DEV =	0x0,
-	TRANS_DEV_TO_TGT =	0x1,
-};
-
-
 static int gen_map_to_dev(struct nvm_tgt_dev *tgt_dev, struct ppa_addr *p)
 {
 	struct gen_dev_map *dev_map = tgt_dev->map;
@@ -523,6 +517,20 @@ static int gen_map_to_tgt(struct nvm_tgt_dev *tgt_dev, struct ppa_addr *p)
 	p->g.lun -= lun_roff;
 
 	return 0;
+}
+
+static struct ppa_addr gen_trans_ppa(struct nvm_tgt_dev *tgt_dev,
+				     struct ppa_addr p, int direction)
+{
+	gen_trans_fn *f;
+	struct ppa_addr ppa = p;
+
+	if (direction == TRANS_TGT_TO_DEV)
+		gen_map_to_dev(tgt_dev, &ppa);
+	else
+		gen_map_to_tgt(tgt_dev, &ppa);
+
+	return ppa;
 }
 
 static int gen_trans_rq(struct nvm_tgt_dev *tgt_dev, struct nvm_rq *rqd,
@@ -631,6 +639,7 @@ static struct nvmm_type gen = {
 	.get_area		= gen_get_area,
 	.put_area		= gen_put_area,
 
+	.trans_ppa		= gen_trans_ppa,
 	.part_to_tgt		= gen_part_to_tgt,
 };
 
