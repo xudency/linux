@@ -763,7 +763,10 @@ static int nvme_nvm_user_vcmd(struct nvme_ns *ns, int admin,
 
 	if (copy_from_user(&vcmd, uvcmd, sizeof(vcmd)))
 		return -EFAULT;
-	if ((vcmd.opcode != 0xF2) && (!capable(CAP_SYS_ADMIN)))
+	if ((vcmd.opcode != nvme_nvm_admin_identity) &&
+				(vcmd.opcode != nvme_nvm_admin_get_bb_tbl) &&
+				(vcmd.opcode != nvme_nvm_admin_set_bb_tbl) &&
+				(!capable(CAP_SYS_ADMIN)))
 		return -EACCES;
 	if (vcmd.flags)
 		return -EINVAL;
