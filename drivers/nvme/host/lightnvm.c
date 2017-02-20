@@ -986,6 +986,9 @@ int nvme_nvm_ns_supported(struct nvme_ns *ns, struct nvme_id_ns *id)
 	/* XXX: this is poking into PCI structures from generic code! */
 	struct pci_dev *pdev = to_pci_dev(ctrl->dev);
 
+	if (!strncmp((char *)id->vs, "open-channel ssd", 16))
+		return 1;
+
 	/* QEMU NVMe simulator - PCI ID + Vendor specific bit */
 	if (pdev->vendor == PCI_VENDOR_ID_CNEX &&
 				pdev->device == PCI_DEVICE_ID_CNEX_QEMU &&
