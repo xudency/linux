@@ -37,6 +37,15 @@
 
 #define NVM_CTRL_FILE "/dev/lightnvm/control"
 
+
+/* one LightNVM Target info */
+struct nvm_tgt_info {
+	char tgtname[NVM_TTYPE_NAME_MAX];
+	char tgttype[NVM_TTYPE_NAME_MAX];
+	__u32 lun_begin;
+	__u32 lun_end;
+};
+
 struct nvm_ioctl_info_tgt {
 	__u32 version[3];
 	__u32 reserved;
@@ -85,6 +94,14 @@ struct nvm_ioctl_create_conf {
 	};
 };
 
+struct nvm_ioctl_get_target {
+	char nvm_dev[DISK_NAME_LEN];		/* open-channel SSD device */
+	__u32 total_luns;
+	__u32 used_luns;
+	__u32 nr_tgt;						/* exist tgt count */
+	struct nvm_tgt_info tgts[31];
+};
+
 struct nvm_ioctl_create {
 	char dev[DISK_NAME_LEN];		/* open-channel SSD device */
 	char tgttype[NVM_TTYPE_NAME_MAX];	/* target type name */
@@ -127,6 +144,7 @@ enum {
 	/* top level cmds */
 	NVM_INFO_CMD = 0x20,
 	NVM_GET_DEVICES_CMD,
+	NVM_GET_TARGET_CMD,
 
 	/* device level cmds */
 	NVM_DEV_CREATE_CMD,
@@ -145,6 +163,8 @@ enum {
 						struct nvm_ioctl_info)
 #define NVM_GET_DEVICES		_IOR(NVM_IOCTL, NVM_GET_DEVICES_CMD, \
 						struct nvm_ioctl_get_devices)
+#define NVM_GET_TARGET		_IOW(NVM_IOCTL, NVM_GET_TARGET_CMD, \
+						struct nvm_ioctl_get_target)
 #define NVM_DEV_CREATE		_IOW(NVM_IOCTL, NVM_DEV_CREATE_CMD, \
 						struct nvm_ioctl_create)
 #define NVM_DEV_REMOVE		_IOW(NVM_IOCTL, NVM_DEV_REMOVE_CMD, \

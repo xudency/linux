@@ -952,6 +952,84 @@ static long nvm_ioctl_get_devices(struct file *file, void __user *arg)
 	return 0;
 }
 
+static void nvm_tgt_lun_scope(struct nvm_tgt_dev *tgt_dev, int *blun, int *elun)
+{
+	struct gen_ch_map *ch_map;
+	struct nvm_dev *dev = tgt_dev->parent;
+	struct gen_dev_map *dev_map = tgt_dev->map;
+	int i, j, ch, lun;
+	int *lun_offs;
+
+	i = 0;
+	ch_map = &dev_map->chnls[i];
+	lun_offs = ch_map->lun_offs;
+	ch = i + ch_map->ch_off;
+
+	j = 0;
+	lun = j + lun_offs[j];
+	*blun = (ch * dev->geo.luns_per_chnl) + lun;
+
+	*elun = *blun + tgt_dev->geo.nr_luns - 1;
+}
+
+static long nvm_ioctl_get_target(struct file *file, void __user *arg)
+{
+	struct nvm_ioctl_get_target *alltgts;
+	struct nvm_target *tgt_iter;
+	struct nvm_dev *dev;
+	struct gen_dev *gn = dev->mp;
+	int i = 0;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	alltgts = kzalloc(sizeof(struct nvm_ioctl_get_target), GFP_KERNEL);
+	if (!alltgts)
+		return -ENOMEM;
+
+	if (copy_from_user(alltgts, arg, sizeof(struct nvm_ioctl_get_target))) {
+		kfree(alltgts);
+		return -EFAULT;
+	}
+
+	alltgts->nvm_dev[DISK_NAME_LEN - 1] = '\0';
+
+	down_write(&nvm_lock);
+	dev = nvm_find_nvm_dev(alltgts->nvm_dev);
+	up_write(&nvm_lock);
+	if (!dev) {
+		pr_err("nvm: device not found\n");
+		kfree(alltgts);
+		return -EINVAL;
+	}
+
+	mutex_lock(&gn->lock);
+	list_for_each_entry(tgt_iter, &gn->targets, list) {
+		int lun_begin, lun_end;
+		struct nvm_tgt_info *tgt = &alltgts->tgts[i];
+		sprintf(tgt->tgtname, "%s", tgt_iter->disk->disk_name);
+		sprintf(tgt->tgttype, "%s", tgt_iter->type->name);
+
+		nvm_tgt_lun_scope(tgt_iter->dev, &lun_begin, &lun_end);
+		tgt->lun_begin = lun_begin;
+		tgt->lun_end = lun_end;
+		alltgts->used_luns += (lun_end - lun_begin + 1);
+		i++;
+	}
+	mutex_unlock(&gn->lock);
+
+	alltgts->nr_tgt = i;
+	alltgts->total_luns = dev->geo.nr_luns;
+
+	if (copy_to_user(arg, alltgts, sizeof(struct nvm_ioctl_get_target))) {
+		kfree(alltgts);
+		return -EFAULT;
+	}
+
+	kfree(alltgts);
+	return 0;
+}
+
 static long nvm_ioctl_dev_create(struct file *file, void __user *arg)
 {
 	struct nvm_ioctl_create create;
@@ -1104,6 +1182,8 @@ static long nvm_ctl_ioctl(struct file *file, uint cmd, unsigned long arg)
 		return nvm_ioctl_info(file, argp);
 	case NVM_GET_DEVICES:
 		return nvm_ioctl_get_devices(file, argp);
+	case NVM_GET_TARGET:
+		return nvm_ioctl_get_target(file, argp);
 	case NVM_DEV_CREATE:
 		return nvm_ioctl_dev_create(file, argp);
 	case NVM_DEV_REMOVE:
